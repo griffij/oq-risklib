@@ -31,7 +31,7 @@ from openquake.hazardlib import geo, site, correlation, imt
 from openquake.hazardlib.calc.hazard_curve import zero_curves
 from openquake.risklib import workflows, riskinput
 
-from openquake.commonlib.datastore import DataStore
+from openquake.commonlib.datastore import DataStore, Fake
 from openquake.commonlib.oqvalidation import OqParam, rmdict
 from openquake.commonlib.node import read_nodes, LiteralNode, context
 from openquake.commonlib import nrml, valid, logictree, InvalidFile, parallel
@@ -474,7 +474,8 @@ def get_source_models(oqparam, source_model_lt, sitecol=None, in_memory=True):
 
 def get_composite_source_model(
         oqparam, sitecol=None, SourceProcessor=source.SourceFilterSplitter,
-        monitor=DummyMonitor(), no_distribute=parallel.no_distribute()):
+        monitor=DummyMonitor(), no_distribute=parallel.no_distribute(),
+        dstore=Fake()):
     """
     Build the source models by splitting the sources. If prefiltering is
     enabled, also reduce the GSIM logic trees in the underlying source models.
@@ -489,10 +490,12 @@ def get_composite_source_model(
         a monitor instance
     :param no_distribute:
         used to disable parallel splitting of the sources
+    :param dstore:
+        a DataStore instance (possibly fake)
     :returns:
         an iterator over :class:`openquake.commonlib.source.SourceModel`
     """
-    processor = SourceProcessor(sitecol, oqparam.maximum_distance)
+    processor = SourceProcessor(sitecol, oqparam.maximum_distance, monitor)
     source_model_lt = get_source_model_lt(oqparam)
     smodels = []
     trt_id = 0
@@ -505,9 +508,7 @@ def get_composite_source_model(
         smodels.append(source_model)
     csm = source.CompositeSourceModel(source_model_lt, smodels)
     if sitecol is not None and hasattr(processor, 'process'):
-        seqtime, partime = processor.process(csm, no_distribute)
-        logging.info('fast sources filtering/splitting: %s', seqtime)
-        logging.info('slow sources filtering/splitting: %s', partime)
+        processor.process(csm, dstore, no_distribute)
         if not csm.get_sources():
             raise RuntimeError('All sources were filtered away')
     csm.count_ruptures()
@@ -586,15 +587,19 @@ def get_risk_model(oqparam):
    :param oqparam:
         an :class:`openquake.commonlib.oqvalidation.OqParam` instance
     """
-    risk_models = {}  # (imt, taxonomy) -> workflow
-    riskmodel = riskinput.RiskModel(risk_models)
+    wfs = {}  # (imt, taxonomy) -> workflow
+    riskmodel = riskinput.RiskModel(wfs)
 
-    if oqparam.calculation_mode.endswith('_damage'):
+    if oqparam.calculation_mode not in workflows.registry:
+        # classical calculator: the riskmodel must be left empty
+        riskmodel.taxonomies = []
+        return riskmodel
+    elif oqparam.calculation_mode.endswith('_damage'):
         # scenario damage calculator
         riskmodel.damage_states = ['no_damage'] + oqparam.limit_states
         delattr(oqparam, 'limit_states')
         for imt_taxo, ffs_by_lt in rmdict.items():
-            risk_models[imt_taxo] = workflows.get_workflow(
+            wfs[imt_taxo] = workflows.get_workflow(
                 imt_taxo[0], imt_taxo[1], oqparam,
                 fragility_functions=ffs_by_lt)
     elif oqparam.calculation_mode.endswith('_bcr'):
@@ -603,7 +608,7 @@ def get_risk_model(oqparam):
         for (imt_taxo, vf_orig), (imt_taxo_, vf_retro) in \
                 zip(rmdict.items(), retro.items()):
             assert imt_taxo == imt_taxo_  # same imt and taxonomy
-            risk_models[imt_taxo] = workflows.get_workflow(
+            wfs[imt_taxo] = workflows.get_workflow(
                 imt_taxo[0], imt_taxo[1], oqparam,
                 vulnerability_functions_orig=vf_orig,
                 vulnerability_functions_retro=vf_retro)
@@ -614,13 +619,13 @@ def get_risk_model(oqparam):
                 # set the seed; this is important for the case of
                 # VulnerabilityFunctionWithPMF
                 vf.seed = oqparam.random_seed
-            risk_models[imt_taxo] = workflows.get_workflow(
+            wfs[imt_taxo] = workflows.get_workflow(
                 imt_taxo[0], imt_taxo[1], oqparam,
                 vulnerability_functions=vfs)
 
     riskmodel.make_curve_builders(oqparam)
     taxonomies = set()
-    for imt_taxo, workflow in risk_models.items():
+    for imt_taxo, workflow in wfs.items():
         taxonomies.add(imt_taxo[1])
         workflow.riskmodel = riskmodel
         # save the number of nonzero coefficients of variation
@@ -761,6 +766,9 @@ def get_exposure(oqparam):
                 cost_type = cost['type']
                 if cost_type in relevant_cost_types:
                     values[cost_type] = cost['value']
+                    retrovalue = cost.attrib.get('retrofitted')
+                    if retrovalue is not None:
+                        retrofitting_values[cost_type] = retrovalue
                     if oqparam.insured_losses:
                         deductibles[cost_type] = cost['deductible']
                         insurance_limits[cost_type] = cost['insuranceLimit']

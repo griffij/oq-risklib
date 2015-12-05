@@ -59,14 +59,21 @@ def build_agg_curve(r_data, insured_losses, ses_ratio, curve_resolution,
     for r, data in r_data:
         if len(data) == 0:  # realization with no losses
             continue
-        E, L, I = data['loss'].shape
+        E, L = data['loss'].shape[:2]
         for l in range(L):
-            for i in range(insured_losses + 1):
-                # if insured_losses is False, don't build them
-                losses, poes = scientific.event_based(
-                    data['loss'][:, l, i], ses_ratio, curve_resolution)
-                avg = scientific.average_loss((losses, poes))
-                result[l, r, i] = (losses, poes, avg)
+            losses, poes = scientific.event_based(
+                data['loss'][:, l, 0], ses_ratio, curve_resolution)
+            avg = scientific.average_loss((losses, poes))
+            result[l, r, 'losses'] = losses
+            result[l, r, 'poes'] = poes
+            result[l, r, 'avg'] = avg
+            if insured_losses:
+                losses_ins, poes_ins = scientific.event_based(
+                    data['loss'][:, l, 1], ses_ratio, curve_resolution)
+                avg_ins = scientific.average_loss((losses_ins, poes_ins))
+                result[l, r, 'losses_ins'] = losses_ins
+                result[l, r, 'poes_ins'] = poes_ins
+                result[l, r, 'avg_ins'] = avg_ins
     return result
 
 
@@ -271,8 +278,7 @@ class EventBasedRiskCalculator(base.RiskCalculator):
         self.C = self.oqparam.loss_curve_resolution
         self.L = L = len(loss_types)
         self.R = R = len(self.rlzs_assoc.realizations)
-        self.loss_curve_dt = numpy.dtype([
-            ('losses', (F32, self.C)), ('poes', (F32, self.C)), ('avg', F32)])
+        self.I = self.oqparam.insured_losses
 
         # ugly: attaching an attribute needed in the task function
         self.monitor.num_assets = self.count_assets()
@@ -309,7 +315,7 @@ class EventBasedRiskCalculator(base.RiskCalculator):
         return apply_reduce(
             self.core_func.__func__,
             (self.riskinputs, self.riskmodel, self.rlzs_assoc,
-             self.assets_by_site, self.monitor),
+             self.assets_by_site, self.monitor.new('task')),
             concurrent_tasks=self.oqparam.concurrent_tasks, agg=self.agg,
             weight=operator.attrgetter('weight'),
             key=operator.attrgetter('col_id'))
@@ -350,9 +356,13 @@ class EventBasedRiskCalculator(base.RiskCalculator):
         insured_losses = self.oqparam.insured_losses
         ses_ratio = self.oqparam.ses_ratio
         saved = self.saved
-        N = len(self.assetcol)
-        R = len(self.rlzs_assoc.realizations)
+        self.N = N = len(self.assetcol)
+        self.R = R = len(self.rlzs_assoc.realizations)
         ltypes = self.riskmodel.loss_types
+
+        self.loss_curve_dt, self.loss_maps_dt = (
+            self.riskmodel.build_loss_dtypes(
+                self.oqparam.conditional_loss_poes, self.I))
 
         # loss curves
         multi_lr_dt = numpy.dtype(
@@ -376,7 +386,7 @@ class EventBasedRiskCalculator(base.RiskCalculator):
 
         # RC, IC
         if self.oqparam.loss_ratios:
-            with self.monitor('building loss_curves-rlzs'):
+            with self.monitor('building rcurves-rlzs'):
                 for (l, r), data in numpy.ndenumerate(result['RC']):
                     cb = self.riskmodel.curve_builders[l]
                     if data and cb.user_provided:
@@ -384,7 +394,7 @@ class EventBasedRiskCalculator(base.RiskCalculator):
                         lt = self.riskmodel.loss_types[l]
                         poes = cb.build_poes(N, [data], ses_ratio)
                         rcurves[lt][:, r, 0] = poes
-                        saved['loss_curves-rlzs'] += poes.nbytes
+                        saved['rcurves-rlzs'] += poes.nbytes
                 for (l, r), data in numpy.ndenumerate(result['IC']):
                     cb = self.riskmodel.curve_builders[l]
                     if data and cb.user_provided and insured_losses:
@@ -392,13 +402,17 @@ class EventBasedRiskCalculator(base.RiskCalculator):
                         lt = self.riskmodel.loss_types[l]
                         poes = cb.build_poes(N, [data], ses_ratio)
                         rcurves[lt][:, r, 1] = poes
-                        saved['loss_curves-rlzs'] += poes.nbytes
-                self.datastore['loss_curves-rlzs'] = rcurves
+                        saved['rcurves-rlzs'] += poes.nbytes
+                self.datastore['rcurves-rlzs'] = rcurves
 
-        # build an aggregate loss curve per realization
-        with self.monitor('building agg_curve-rlzs'):
-            self.build_agg_curve()
+        oq = self.oqparam
+        builder = scientific.StatsBuilder(
+            oq.quantile_loss_curves, oq.conditional_loss_poes, [],
+            oq.loss_curve_resolution, scientific.normalize_curves_eb)
 
+        # build an aggregate loss curve per realization plus statistics
+        with self.monitor('building agg_curve'):
+            self.build_agg_curve_and_stats(builder)
         self.datastore.hdf5.flush()
 
         for out in sorted(saved):
@@ -411,47 +425,55 @@ class EventBasedRiskCalculator(base.RiskCalculator):
             pass  # TODO: build specific loss curves
 
         rlzs = self.rlzs_assoc.realizations
-
         with self.monitor('building loss_maps-rlzs'):
             if (self.oqparam.conditional_loss_poes and
-                    'loss_curves-rlzs' in self.datastore):
-                rcurves = self.datastore['loss_curves-rlzs']
+                    'rcurves-rlzs' in self.datastore):
+                loss_maps = numpy.zeros((N, R), self.loss_maps_dt)
+                rcurves = self.datastore['rcurves-rlzs']
                 for cb in self.riskmodel.curve_builders:
-                    for r, loss_maps in cb.build_loss_maps(
-                            self.assetcol, rcurves):
-                        key = 'loss_maps-rlzs/%s/%s' % (
-                            cb.loss_type, rlzs[r].uid)
-                        self.datastore[key] = loss_maps
+                    if cb.user_provided:
+                        lm = loss_maps[cb.loss_type]
+                        for r, lmaps in cb.build_loss_maps(
+                                self.assetcol, rcurves):
+                            lm[:, r] = lmaps
+                self.datastore['loss_maps-rlzs'] = loss_maps
 
         if len(rlzs) > 1:
+            self.Q1 = len(self.oqparam.quantile_loss_curves) + 1
             with self.monitor('computing stats'):
-                self.compute_store_stats(rlzs)
+                self.compute_store_stats(rlzs, builder)
 
-    def build_agg_curve(self):
+    def build_agg_curve_and_stats(self, builder):
         """
         Build a single loss curve per realization. It is NOT obtained
         by aggregating the loss curves; instead, it is obtained without
         generating the loss curves, directly from the the aggregate losses.
         """
-        C = self.oqparam.loss_curve_resolution
-        I = self.oqparam.insured_losses
+        oq = self.oqparam
+        C = oq.loss_curve_resolution
+        loss_curve_dt, _ = self.riskmodel.build_all_loss_dtypes(
+            C, oq.conditional_loss_poes, oq.insured_losses)
+        lts = self.riskmodel.loss_types
         r_data = [(r, dset.value) for r, dset in enumerate(
             self.datastore['agg_loss_table'].values())]
         ses_ratio = self.oqparam.ses_ratio
         result = parallel.apply_reduce(
-            build_agg_curve, (r_data, I, ses_ratio, C, self.monitor),
+            build_agg_curve, (r_data, self.I, ses_ratio, C, self.monitor('')),
             concurrent_tasks=self.oqparam.concurrent_tasks)
-        agg_curve = numpy.zeros((self.L, self.R, 2), self.loss_curve_dt)
-        for l, r, i in result:
-            agg_curve[l, r, i] = result[l, r, i]
+        agg_curve = numpy.zeros(self.R, loss_curve_dt)
+        for l, r, name in result:
+            agg_curve[lts[l]][name][r] = result[l, r, name]
         self.datastore['agg_curve-rlzs'] = agg_curve
         self.saved['agg_curve-rlzs'] = agg_curve.nbytes
+
+        if self.R > 1:
+            self.build_agg_curve_stats(builder, loss_curve_dt)
 
     # ################### methods to compute statistics  #################### #
 
     def _collect_all_data(self):
         # return a list of list of outputs
-        if 'loss_curves-rlzs' not in self.datastore:
+        if 'rcurves-rlzs' not in self.datastore:
             return []
         all_data = []
         assets = self.assetcol['asset_ref']
@@ -461,7 +483,7 @@ class EventBasedRiskCalculator(base.RiskCalculator):
             avg_losses = self.datastore['avg_losses-rlzs'].value
         else:
             avg_losses = self.avg_losses
-        r_curves = self.datastore['loss_curves-rlzs'].value
+        r_curves = self.datastore['rcurves-rlzs'].value
         for loss_type, cbuilder in zip(
                 self.riskmodel.loss_types, self.riskmodel.curve_builders):
             rcurves = r_curves[loss_type]
@@ -492,43 +514,38 @@ class EventBasedRiskCalculator(base.RiskCalculator):
     # a different discretization. This is not needed for the loss maps, but it
     # is done anyway for consistency, also because in the future we could
     # specify different conditional loss poes depending on the loss type
-    def compute_store_stats(self, rlzs):
+    def compute_store_stats(self, rlzs, builder):
         """
         Compute and store the statistical outputs.
         :param rlzs: list of realizations
         """
         oq = self.oqparam
         ltypes = self.riskmodel.loss_types
-        builder = scientific.StatsBuilder(
-            oq.quantile_loss_curves, oq.conditional_loss_poes, [],
-            oq.loss_curve_resolution, scientific.normalize_curves_eb)
         all_stats = map(builder.build, self._collect_all_data())
+        if not all_stats:
+            return
+        loss_curves = numpy.zeros((self.Q1, self.N), self.loss_curve_dt)
+        loss_maps = numpy.zeros((self.Q1, self.N), self.loss_maps_dt)
         for stats in all_stats:
             # there is one stat for each loss_type
-            N = len(stats.assets)
             cb = self.riskmodel.curve_builders[ltypes.index(stats.loss_type)]
             if not cb.user_provided:
                 continue
             sb = scientific.StatsBuilder(
                 oq.quantile_loss_curves, oq.conditional_loss_poes, [],
-                len(cb.ratios), scientific.normalize_curves_eb)
-            curves, maps = sb.get_curves_maps(stats)
-            for i, path in enumerate(stats.paths):
-                # there are paths like
-                # %s-stats/structural/mean
-                # %s-stats/structural/quantile-0.1
-                # ...
-                lcs = numpy.zeros((N, 2), sb.loss_curve_dt)
-                lms = numpy.zeros((N, 2), sb.loss_map_dt)
-                for ins in 0, 1:
-                    for aid in range(N):
-                        lcs[aid, ins] = curves[ins][i, aid]
-                        lms[aid, ins] = maps[ins][i, aid]
-                self.datastore[path % 'loss_curves'] = lcs
-                if oq.conditional_loss_poes:
-                    self.datastore[path % 'loss_maps'] = lms
-
-        self.build_agg_curve_stats(builder)
+                len(cb.ratios), scientific.normalize_curves_eb,
+                oq.insured_losses)
+            curves, maps = sb.get_curves_maps(stats)  # matrices (Q1, N)
+            lc = loss_curves[cb.loss_type]
+            lm = loss_maps[cb.loss_type]
+            for i, statname in enumerate(sb.mean_quantiles):
+                for name in curves.dtype.names:
+                    lc[name][i] = curves[name][i]
+                for name in maps.dtype.names:
+                    lm[name][i] = maps[name][i]
+        self.datastore['loss_curves-stats'] = loss_curves
+        if oq.conditional_loss_poes:
+            self.datastore['loss_maps-stats'] = loss_maps
 
         if oq.avg_losses:  # stats for avg_losses
             stats = scientific.SimpleStats(rlzs, oq.quantile_loss_curves)
@@ -536,7 +553,7 @@ class EventBasedRiskCalculator(base.RiskCalculator):
 
         self.datastore.hdf5.flush()
 
-    def build_agg_curve_stats(self, builder):
+    def build_agg_curve_stats(self, builder, loss_curve_dt):
         """
         Build and save `agg_curve-stats` in the HDF5 file.
 
@@ -545,17 +562,20 @@ class EventBasedRiskCalculator(base.RiskCalculator):
         """
         rlzs = self.datastore['rlzs_assoc'].realizations
         agg_curve = self.datastore['agg_curve-rlzs']
-        Q1 = len(builder.quantiles) + 1
+        Q1 = len(builder.mean_quantiles)
+        agg_curve_stats = numpy.zeros(Q1, loss_curve_dt)
         for l, loss_type in enumerate(self.riskmodel.loss_types):
+            agg_curve_lt = agg_curve[loss_type]
             outputs = []
             for rlz in rlzs:
-                curve = agg_curve[l, rlz.ordinal]
-                average_loss = curve['avg'][0]
-                average_insured_loss = curve['avg'][1]
-                loss_curve = (curve['losses'][0], curve['poes'][0])
+                curve = agg_curve_lt[rlz.ordinal]
+                average_loss = curve['avg']
+                loss_curve = (curve['losses'], curve['poes'])
                 if self.oqparam.insured_losses:
-                    insured_curves = [(curve['losses'][1], curve['poes'][1])]
+                    average_insured_loss = curve['avg_ins']
+                    insured_curves = [(curve['losses_ins'], curve['poes_ins'])]
                 else:
+                    average_insured_loss = None
                     insured_curves = None
                 out = scientific.Output(
                     [None], loss_type, rlz.ordinal, rlz.weight,
@@ -565,15 +585,13 @@ class EventBasedRiskCalculator(base.RiskCalculator):
                     average_insured_losses=[average_insured_loss])
                 outputs.append(out)
             stats = builder.build(outputs)
-            curves, _maps = builder.get_curves_maps(stats)
-            # arrays of shape (2, Q1, 1)
-            agg_curve_stats = numpy.zeros((Q1, 2), self.loss_curve_dt)
-            for name in self.loss_curve_dt.names:
-                agg_curve_stats[name][:, 0] = curves[0][name][:, 0]
-                if self.oqparam.insured_losses:
-                    agg_curve_stats[name][:, 1] = curves[1][name][:, 0]
-
+            curves, _maps = builder.get_curves_maps(stats)  # shape (Q1, 1)
+            acs = agg_curve_stats[loss_type]
             for i, statname in enumerate(builder.mean_quantiles):
-                key = 'agg_curve-stats/%s/%s' % (loss_type, statname)
-                self.datastore[key] = agg_curve_stats[i]
-                self.datastore[key].attrs['nbytes'] = agg_curve_stats[i].nbytes
+                for name in acs.dtype.names:
+                    acs[name][i] = curves[name][i]
+
+        # saving agg_curve_stats
+        self.datastore['agg_curve-stats'] = agg_curve_stats
+        self.datastore['agg_curve-stats'].attrs['nbytes'] = (
+            agg_curve_stats.nbytes)

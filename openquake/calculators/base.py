@@ -70,7 +70,6 @@ class BaseCalculator(with_metaclass(abc.ABCMeta)):
     taxonomies = datastore.persistent_attribute('taxonomies')
     job_info = datastore.persistent_attribute('job_info')
     source_chunks = datastore.persistent_attribute('source_chunks')
-    source_pre_info = datastore.persistent_attribute('source_pre_info')
     performance = datastore.persistent_attribute('performance')
     csm = datastore.persistent_attribute('composite_source_model')
     pre_calculator = None  # to be overridden
@@ -100,11 +99,19 @@ class BaseCalculator(with_metaclass(abc.ABCMeta)):
         self.datastore.attrs['oqlite_version'] = repr(__version__)
         self.datastore.hdf5.flush()
 
+    def set_log_format(self):
+        """Set the format of the root logger"""
+        fmt = '[%(asctime)s #{} %(levelname)s] %(message)s'.format(
+                self.datastore.calc_id)
+        for handler in logging.root.handlers:
+            handler.setFormatter(logging.Formatter(fmt))
+
     def run(self, pre_execute=True, clean_up=True, concurrent_tasks=None,
             **kw):
         """
         Run the calculation and return the exported outputs.
         """
+        self.set_log_format()
         if concurrent_tasks is not None:
             self.oqparam.concurrent_tasks = concurrent_tasks
         self.save_params(**kw)
@@ -194,6 +201,8 @@ class HazardCalculator(BaseCalculator):
     """
     Base class for hazard calculators based on source models
     """
+    riskmodel = datastore.persistent_attribute('riskmodel')
+
     mean_curves = None  # to be overridden
     SourceProcessor = source.SourceFilterSplitter
 
@@ -253,17 +262,17 @@ class HazardCalculator(BaseCalculator):
                 self.datastore.set_parent(datastore.DataStore(precalc_id))
                 # update oqparam with the attributes saved in the datastore
                 self.oqparam = OqParam.from_(self.datastore.attrs)
-                self.read_exposure_sitecol()
+                self.read_risk_data()
 
         else:  # we are in a basic calculator
-            self.read_exposure_sitecol()
+            self.read_risk_data()
             self.read_sources()
         self.datastore.hdf5.flush()
 
     def read_exposure(self):
         """
-        Read the exposure and update the attributes .exposure, .sitecol,
-        .assets_by_site, .cost_types, .taxonomies
+        Read the exposure, the riskmodel and update the attributes .exposure,
+        .sitecol, .assets_by_site, .cost_types, .taxonomies.
         """
         logging.info('Reading the exposure')
         with self.monitor('reading exposure', autoflush=True):
@@ -275,10 +284,37 @@ class HazardCalculator(BaseCalculator):
             self.taxonomies = numpy.array(
                 sorted(self.exposure.taxonomies), '|S100')
 
-    def read_exposure_sitecol(self):
+    def load_riskmodel(self):
         """
-        Read the exposure (if any) and then the site collection, possibly
-        extracted from the exposure.
+        Read the risk model and set the attribute .riskmodel.
+        The riskmodel can be empty for hazard calculations.
+        Save the loss ratios (if any) in the datastore.
+        """
+        self.riskmodel = rm = readinput.get_risk_model(self.oqparam)
+        missing = set(self.taxonomies) - set(rm.taxonomies)
+        if rm and missing:
+            raise RuntimeError('The exposure contains the taxonomies %s '
+                               'which are not in the risk model' % missing)
+
+        # save the loss ratios in the datastore
+        pairs = [(cb.loss_type, (numpy.float64, len(cb.ratios)))
+                 for cb in rm.curve_builders if cb.user_provided]
+        if not pairs:
+            return
+        loss_ratios = numpy.zeros(len(rm), numpy.dtype(pairs))
+        for cb in rm.curve_builders:
+            if cb.user_provided:
+                loss_ratios_lt = loss_ratios[cb.loss_type]
+                for i, imt_taxo in enumerate(sorted(rm)):
+                    loss_ratios_lt[i] = rm[imt_taxo].loss_ratios[cb.loss_type]
+        self.datastore['loss_ratios'] = loss_ratios
+        self.datastore['loss_ratios'].attrs['imt_taxos'] = sorted(rm)
+        self.datastore['loss_ratios'].attrs['nbytes'] = loss_ratios.nbytes
+
+    def read_risk_data(self):
+        """
+        Read the exposure (if any), the risk model (if any) and then the
+        site collection, possibly extracted from the exposure.
         """
         logging.info('Reading the site collection')
         with self.monitor('reading site collection', autoflush=True):
@@ -286,6 +322,7 @@ class HazardCalculator(BaseCalculator):
         inputs = self.oqparam.inputs
         if 'exposure' in inputs:
             self.read_exposure()
+            self.load_riskmodel()  # must be called *after* read_exposure
             num_assets = self.count_assets()
             if self.datastore.parent:
                 haz_sitecol = self.datastore.parent['sitecol']
@@ -300,6 +337,8 @@ class HazardCalculator(BaseCalculator):
         elif (self.datastore.parent and 'exposure' in
               OqParam.from_(self.datastore.parent.attrs).inputs):
             logging.info('Re-using the already imported exposure')
+            if not self.riskmodel:
+                self.load_riskmodel()
         else:  # no exposure
             self.sitecol = haz_sitecol
 
@@ -327,7 +366,7 @@ class HazardCalculator(BaseCalculator):
     def read_sources(self):
         """
         Read the composite source model (if any).
-        This method must be called after read_exposure_sitecol, to be able
+        This method must be called after read_risk_data, to be able
         to filter to sources according to the site collection.
         """
         if 'source' in self.oqparam.inputs:
@@ -336,9 +375,8 @@ class HazardCalculator(BaseCalculator):
                     'reading composite source model', autoflush=True):
                 self.csm = readinput.get_composite_source_model(
                     self.oqparam, self.sitecol, self.SourceProcessor,
-                    self.monitor)
+                    self.monitor, dstore=self.datastore)
                 # we could manage limits here
-                self.source_pre_info = self.csm.source_info
                 self.job_info = readinput.get_job_info(
                     self.oqparam, self.csm, self.sitecol)
                 self.csm.count_ruptures()
@@ -361,9 +399,8 @@ class RiskCalculator(HazardCalculator):
     attributes .riskmodel, .sitecol, .assets_by_site, .exposure
     .riskinputs in the pre_execute phase.
     """
-
-    riskmodel = datastore.persistent_attribute('riskmodel')
     specific_assets = datastore.persistent_attribute('specific_assets')
+    extra_args = ()  # to be overridden in subclasses
 
     def make_eps(self, num_ruptures):
         """
@@ -429,24 +466,6 @@ class RiskCalculator(HazardCalculator):
         """
         return ri.imt
 
-    def pre_execute(self):
-        """
-        Perform hazard pre_execute and read the riskmodel
-        """
-        HazardCalculator.pre_execute(self)
-        self.read_riskmodel()
-
-    def read_riskmodel(self):
-        """
-        Check the taxonomies and set the attribute .riskmodel
-        """
-        self.riskmodel = readinput.get_risk_model(self.oqparam)
-        if hasattr(self, 'exposure'):
-            missing = self.exposure.taxonomies - set(self.riskmodel.taxonomies)
-            if missing:
-                raise RuntimeError('The exposure contains the taxonomies %s '
-                                   'which are not in the risk model' % missing)
-
     def execute(self):
         """
         Parallelize on the riskinputs and returns a dictionary of results.
@@ -460,9 +479,10 @@ class RiskCalculator(HazardCalculator):
         if self.pre_calculator == 'event_based_rupture':
             self.monitor.assets_by_site = self.assets_by_site
             self.monitor.num_assets = self.count_assets()
+        all_args = ((self.riskinputs, self.riskmodel, self.rlzs_assoc) +
+                    self.extra_args + (self.monitor,))
         res = apply_reduce(
-            self.core_func.__func__,
-            (self.riskinputs, self.riskmodel, self.rlzs_assoc, self.monitor),
+            self.core_func.__func__, all_args,
             concurrent_tasks=self.oqparam.concurrent_tasks,
             weight=get_weight, key=self.riskinput_key)
         return res

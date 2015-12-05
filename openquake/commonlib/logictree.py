@@ -71,8 +71,12 @@ class RlzsAssoc(collections.Mapping):
     def __init__(self, realizations):
         self.realizations = realizations
         self.rlzs_assoc = {}
+        self.gsims_by_trt_id = {0: []}
         for rlz in realizations:
-            self.rlzs_assoc[0, str(rlz)] = [rlz]
+            rlz_str = str(rlz)
+            self.rlzs_assoc[0, rlz_str] = [rlz]
+            if rlz_str != 'FromFile':
+                self.gsims_by_trt_id[0].append(valid.gsim(rlz_str))
 
     def combine(self, result):  # this is used in the workers
         """
@@ -120,7 +124,7 @@ def trivial_rlzs_assoc():
     reading the hazard from a file.
     """
     fake_rlz = Realization(
-        value=('FromFile',), weight=1, lt_path=('',), ordinal=0, lt_uid=('*',))
+        value=('FromFile',), weight=1, lt_path=('',), ordinal=0, lt_uid=('@',))
     return RlzsAssoc([fake_rlz])
 
 

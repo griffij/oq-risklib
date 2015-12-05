@@ -31,6 +31,7 @@ class EventBasedRiskTestCase(CalculatorTestCase):
                     all_csv.append(fname)
         assert all_csv, 'Could not find any CSV file??'
         for fname in all_csv:
+            print fname, 'expected/%s' % strip_calc_id(fname)
             self.assertEqualFiles(
                 'expected/%s' % strip_calc_id(fname), fname)
 
@@ -42,8 +43,8 @@ class EventBasedRiskTestCase(CalculatorTestCase):
         ekeys = [
             ('loss_curves-stats', 'xml'),
             ('loss_curves-stats', 'geojson'),
-            ('loss_curves-rlzs', 'xml'),
-            ('loss_curves-rlzs', 'geojson'),
+            ('rcurves-rlzs', 'xml'),
+            ('rcurves-rlzs', 'geojson'),
 
             ('loss_maps-stats', 'xml'),
             ('loss_maps-stats', 'geojson'),
