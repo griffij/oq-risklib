@@ -18,7 +18,7 @@ xmlns="http://openquake.org/xmlns/nrml/0.5"
         id="Wood"
         shape="logncdf"
         >
-            <imls imt="PGA" maxIML="1.40" minIML="0.00"/>
+            <imls imt="PGA" maxIML="1.40" minIML="0.001"/>
             <params ls="slight" mean="1.6000000E-01" stddev="1.0400000E-01"/>
             <params ls="moderate" mean="2.2500000E-01" stddev="1.5800000E-01"/>
             <params ls="extreme" mean="4.0000000E-01" stddev="3.0000000E-01"/>

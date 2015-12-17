@@ -20,7 +20,7 @@ xmlns="http://openquake.org/xmlns/nrml/0.5"
         >
             <imls
             imt="PGA"
-            noDamageLimit="0.0000000E+00"
+            noDamageLimit="0.001"
             >
                 0.2 0.4 0.6 0.8 1.0 1.2 1.4
             </imls>

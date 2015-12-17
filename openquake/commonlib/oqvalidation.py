@@ -240,7 +240,7 @@ class OqParam(valid.ParamSet):
         :param ddict:
             a dictionary (imt, taxo) -> loss_type -> risk_function
 
-        Set the attributes risk_imtls and hazard_imtls.
+        Set the attribute risk_imtls.
         """
         # NB: different loss types may have different IMLs for the same IMT
         # in that case we merge the IMLs
@@ -255,6 +255,7 @@ class OqParam(valid.ParamSet):
                     imtls[imt] = sorted(set(imls + imtls[imt]))
                 else:
                     imtls[imt] = imls
+            #imtls[imt] = [lvl for lvl in imtls[imt] if lvl > 0]
         self.risk_imtls = imtls
 
     def no_imls(self):
