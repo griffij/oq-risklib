@@ -22,6 +22,10 @@ import logging
 import cProfile
 import pstats
 import io
+try:
+    import tracemalloc
+except ImportError:
+    tracemalloc = None
 
 from openquake.baselib import performance, general
 from openquake.commonlib import sap, readinput, valid, datastore, oqvalidation
@@ -163,7 +167,15 @@ def run(job_ini, slowest, hc, param, concurrent_tasks=CT, exports='',
         print('Saved profiling info in %s' % pstat)
         print(get_pstats(pstat, slowest))
     else:
+        if tracemalloc:
+            tracemalloc.start()
         _run(job_ini, concurrent_tasks, pdb, loglevel, hc, exports, params)
+        if tracemalloc:
+            snapshot = tracemalloc.take_snapshot()
+            top_stats = snapshot.statistics('lineno')
+            print("[ Top 10 ]")
+            for stat in top_stats[:10]:
+                print(stat)
 
 parser = sap.Parser(run)
 parser.arg('job_ini', 'calculation configuration file '
