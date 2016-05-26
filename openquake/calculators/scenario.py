@@ -1,52 +1,34 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
-
-import random
-import logging
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 import collections
-
 import numpy
 
 from openquake.hazardlib.calc import filters
 from openquake.hazardlib.calc.gmf import GmfComputer
-from openquake.commonlib import readinput, parallel, datastore
+from openquake.commonlib import readinput, source
+from openquake.calculators import base
 
-from openquake.calculators import base, calc
+U8 = numpy.uint8
+U16 = numpy.uint16
+U32 = numpy.uint32
+F32 = numpy.float32
 
-Rupture = collections.namedtuple('Rupture', 'tag seed rupture')
-
-
-@parallel.litetask
-def calc_gmfs(tag_seed_pairs, computer, monitor):
-    """
-    Computes several GMFs in parallel, one for each tag and seed.
-
-    :param tag_seed_pairs:
-        list of pairs (rupture tag, rupture seed)
-    :param computer:
-        :class:`openquake.hazardlib.calc.gmf.GMFComputer` instance
-    :param monitor:
-        :class:`openquake.baselib.performance.PerformanceMonitor` instance
-    :returns:
-        a dictionary tag -> gmf
-    """
-    tags, seeds = zip(*tag_seed_pairs)
-    return dict(zip(tags, computer.compute(seeds)))
+gmv_dt = numpy.dtype([('sid', U16), ('eid', U32), ('imti', U8), ('gmv', F32)])
 
 
 @base.calculators.add('scenario')
@@ -54,63 +36,63 @@ class ScenarioCalculator(base.HazardCalculator):
     """
     Scenario hazard calculator
     """
-    core_func = calc_gmfs
-    tags = datastore.persistent_attribute('tags')
-    sescollection = datastore.persistent_attribute('sescollection')
     is_stochastic = True
 
     def pre_execute(self):
         """
-        Read the site collection and initialize GmfComputer, tags and seeds
+        Read the site collection and initialize GmfComputer, etags and seeds
         """
         super(ScenarioCalculator, self).pre_execute()
-        trunc_level = self.oqparam.truncation_level
-        correl_model = readinput.get_correl_model(self.oqparam)
-        n_gmfs = self.oqparam.number_of_ground_motion_fields
-        rupture = readinput.get_rupture(self.oqparam)
-        self.gsims = readinput.get_gsims(self.oqparam)
-        self.rlzs_assoc = readinput.get_rlzs_assoc(self.oqparam)
-
+        oq = self.oqparam
+        trunc_level = oq.truncation_level
+        correl_model = readinput.get_correl_model(oq)
+        n_gmfs = oq.number_of_ground_motion_fields
+        rupture = readinput.get_rupture(oq)
+        self.gsims = readinput.get_gsims(oq)
+        maxdist = oq.maximum_distance['default']
         with self.monitor('filtering sites', autoflush=True):
             self.sitecol = filters.filter_sites_by_distance_to_rupture(
-                rupture, self.oqparam.maximum_distance, self.sitecol)
+                rupture, maxdist, self.sitecol)
         if self.sitecol is None:
             raise RuntimeError(
-                'All sites were filtered out! '
-                'maximum_distance=%s km' % self.oqparam.maximum_distance)
-        self.tags = numpy.array(
-            sorted(['scenario-%010d' % i for i in range(n_gmfs)]),
+                'All sites were filtered out! maximum_distance=%s km' %
+                maxdist)
+        self.etags = numpy.array(
+            sorted(['scenario-%010d~ses=1' % i for i in range(n_gmfs)]),
             (bytes, 100))
         self.computer = GmfComputer(
-            rupture, self.sitecol, self.oqparam.imtls, self.gsims,
+            rupture, self.sitecol, oq.imtls, self.gsims,
             trunc_level, correl_model)
-        rnd = random.Random(self.oqparam.random_seed)
-        self.tag_seed_pairs = [(tag, rnd.randint(0, calc.MAX_INT))
-                               for tag in self.tags]
-        self.sescollection = [{tag: Rupture(tag, seed, rupture)
-                               for tag, seed in self.tag_seed_pairs}]
+        gsim_lt = readinput.get_gsim_lt(oq)
+        cinfo = source.CompositionInfo.fake(gsim_lt)
+        self.datastore['csm_info'] = cinfo
+        self.rlzs_assoc = cinfo.get_rlzs_assoc()
+
+    def init(self):
+        pass
 
     def execute(self):
         """
-        Compute the GMFs in parallel and return a dictionary gmf_by_tag
+        Compute the GMFs and return a dictionary rlzi -> array gmv_dt
         """
+        res = collections.defaultdict(list)
+        sids = self.sitecol.sids
         with self.monitor('computing gmfs', autoflush=True):
-            args = (self.tag_seed_pairs, self.computer, self.monitor('calc_gmfs'))
-            gmf_by_tag = parallel.apply_reduce(
-                self.core_func.__func__, args,
-                concurrent_tasks=self.oqparam.concurrent_tasks)
-            return gmf_by_tag
-    
-    def post_execute(self, gmf_by_tag):
+            n = self.oqparam.number_of_ground_motion_fields
+            for i, gsim in enumerate(self.gsims):
+                gmfa = self.computer.compute(
+                    self.oqparam.random_seed, gsim, n)
+                for (imti, sid, eid), gmv in numpy.ndenumerate(gmfa):
+                    res[i].append((sids[sid], eid, imti, gmv))
+            return {rlzi: numpy.array(res[rlzi], gmv_dt) for rlzi in res}
+
+    def post_execute(self, gmfa_by_rlzi):
         """
-        :param gmf_by_tag: a dictionary tag -> gmf
+        :param gmfa: a dictionary rlzi -> gmfa
         """
         with self.monitor('saving gmfs', autoflush=True):
-            data = []
-            for ordinal, tag in enumerate(sorted(gmf_by_tag)):
-                gmf = gmf_by_tag[tag]
-                gmf['idx'] = ordinal
-                data.append(gmf)
-            gmfa = numpy.concatenate(data)
-            self.datastore['gmfs/col00'] = gmfa
-            self.datastore['gmfs'].attrs['nbytes'] = gmfa.nbytes
+            for rlzi, gsim in enumerate(self.gsims):
+                rlzstr = 'gmf_data/%04d' % rlzi
+                self.datastore[rlzstr] = gmfa_by_rlzi[rlzi]
+                self.datastore.set_attrs(rlzstr, gsim=str(gsim))
+            self.datastore.set_nbytes('gmf_data')

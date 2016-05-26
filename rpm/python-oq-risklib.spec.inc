@@ -17,8 +17,8 @@ BuildArch: noarch
 Vendor: GEM Foundation <devops@openquake.org>
 Url: http://github.com/gem/oq-risklib
 
-%define common_deps python numpy scipy python-shapely python-psutil python-futures python-decorator python-mock h5py
-%define oqlib_deps python-oq-hazardlib >= 0.17.0
+%define common_deps python numpy scipy python-shapely python-psutil python-futures python-decorator python-mock python-prctl h5py
+%define oqlib_deps python-oq-hazardlib >= 0.20.0
 %define dev_deps python-nose python-coverage
 
 Requires: %{common_deps}
@@ -50,7 +50,7 @@ of this library by adding the most common methodologies used by seismic risk
 modellers. Comments, suggestions and criticisms from the community are always
 very welcome.
 
-Copyright (C) 2013-2015, GEM Foundation.
+Copyright (C) 2013-2016 GEM Foundation
 
 
 %prep

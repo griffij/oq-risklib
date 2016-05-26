@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
-
-# Copyright (c) 2013-2014, GEM Foundation.
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 #
-# OpenQuake Risklib is free software: you can redistribute it and/or
-# modify it under the terms of the GNU Affero General Public License
-# as published by the Free Software Foundation, either version 3 of
-# the License, or (at your option) any later version.
+# Copyright (C) 2013-2016 GEM Foundation
 #
-# OpenQuake Risklib is distributed in the hope that it will be useful,
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public
-# License along with OpenQuake Risklib. If not, see
-# <http://www.gnu.org/licenses/>.
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import unittest
 import mock
@@ -65,6 +65,10 @@ class TestMemoize(unittest.TestCase):
         self.assertEqual(1, m.call_count)
 
 
+epsilons = scientific.make_epsilons(
+    numpy.zeros((1, 3)), seed=3, correlation=0)[0]
+
+
 class VulnerabilityFunctionTestCase(unittest.TestCase):
     """
     Test for
@@ -92,10 +96,6 @@ class VulnerabilityFunctionTestCase(unittest.TestCase):
         self.test_func = scientific.VulnerabilityFunction(
             self.ID, self.IMT, self.IMLS_GOOD, self.LOSS_RATIOS_GOOD,
             self.COVS_GOOD)
-
-        epsilons = scientific.make_epsilons(
-            numpy.zeros((1, 3)), seed=3, correlation=0)
-        self.test_func.set_distribution(epsilons)
 
     def test_vuln_func_constructor_raises_on_bad_imls(self):
         # This test attempts to invoke AssertionErrors by passing 3 different
@@ -163,9 +163,8 @@ class VulnerabilityFunctionTestCase(unittest.TestCase):
     def test_loss_ratio_interp_many_values(self):
         expected_lrs = numpy.array([0.0161928, 0.05880167, 0.12242504])
         test_input = [0.005, 0.006, 0.0269]
-
         numpy.testing.assert_allclose(
-            expected_lrs, self.test_func._apply(test_input))
+            expected_lrs, self.test_func(test_input, epsilons))
 
     def test_loss_ratio_interp_many_values_clipped(self):
         # Given a list of IML values (abscissae), test for proper interpolation
@@ -175,7 +174,7 @@ class VulnerabilityFunctionTestCase(unittest.TestCase):
         expected_lrs = numpy.array([0., 0.05880167, 0.12242504])
         test_input = [0.00049, 0.006, 2.7]
         numpy.testing.assert_allclose(
-            expected_lrs, self.test_func._apply(test_input))
+            expected_lrs, self.test_func(test_input, epsilons))
 
     def test_cov_interp_many_values(self):
         expected_covs = numpy.array([0.3, 0.2, 10])
@@ -300,7 +299,7 @@ class VulnerabilityFunctionBlockSizeTestCase(unittest.TestCase):
                -0.46341769, 0.24196227, -1.72491783, -1.01283112, -0.90802408,
                1.46564877, 0.0675282, -0.54438272, -1.15099358, -0.60063869,
                -0.60170661, -0.01349722, 0.82254491, 0.2088636, -1.32818605]
-        singleblock = list(self.vf.apply_to([gmvs], [eps]).reshape(-1))
+        singleblock = list(self.vf(gmvs, eps).reshape(-1))
 
         # multiblock
         gmvs_, eps_ = [None] * 7, [None] * 7
@@ -320,7 +319,7 @@ class VulnerabilityFunctionBlockSizeTestCase(unittest.TestCase):
         eps_[6] = [0.2088636, -1.32818605]
         multiblock = []
         for gmvs, eps in zip(gmvs_, eps_):
-            multiblock.extend(self.vf.apply_to([gmvs], [eps]).reshape(-1))
+            multiblock.extend(self.vf(gmvs, eps).reshape(-1))
 
         # this test has been broken forever, finally fixed in OpenQuake 1.5
         self.assertEqual(singleblock, multiblock)
@@ -337,21 +336,21 @@ class MeanLossTestCase(unittest.TestCase):
                     -0.82757864, 0.53465707, 1.22838619]
         imls = [0.280357, 0.443609, 0.241845, 0.506982, 0.459758,
                 0.456199, 0.38077]
-        mean = vf.apply_to([imls], [epsilons])[0].mean()
+        mean = vf(imls, epsilons).mean()
         aaae(mean, 0.2318058254)
 
         # if you don't reorder the epsilons, the mean loss depends on
         # the order of the imls!
         reordered_imls = [0.443609, 0.280357, 0.241845, 0.506982, 0.459758,
                           0.456199, 0.38077]
-        mean2 = vf.apply_to([reordered_imls], [epsilons])[0].mean()
+        mean2 = vf(reordered_imls, epsilons).mean()
         aaae(mean2, 0.238145174018)
         self.assertGreater(abs(mean2 - mean), 0.005)
 
         # by reordering the epsilons the problem is solved
         reordered_epsilons = [0.2776809, 0.98982371, -0.44858935, 0.96196624,
                               -0.82757864, 0.53465707, 1.22838619]
-        mean3 = vf.apply_to([reordered_imls], [reordered_epsilons])[0].mean()
+        mean3 = vf(reordered_imls, reordered_epsilons).mean()
         aaae(mean3, mean)
 
 
@@ -389,7 +388,7 @@ class LogNormalDistributionTestCase(unittest.TestCase):
         self.dist = scientific.LogNormalDistribution(epsilons)
         samples = self.dist.sample(numpy.array([0., 0., .1, .1]),
                                    numpy.array([0., .1, 0., .1]),
-                                   None, slice(None))
+                                   None, slice(None)).reshape(-1)
         numpy.testing.assert_allclose([0., 0., 0.1, 0.10228396], samples)
 
 
@@ -634,7 +633,9 @@ class LossMapMatrixTest(unittest.TestCase):
 class ClassicalDamageTestCase(unittest.TestCase):
     def test_discrete(self):
         hazard_imls = [0.05, 0.2, 0.4, 0.6, 0.8, 1, 1.2, 1.4]
-        fragility_functions = scientific.FragilityFunctionList([
+        fragility_functions = scientific.FragilityFunctionList(
+            [], imls=hazard_imls, steps_per_interval=None)
+        fragility_functions.extend([
             scientific.FragilityFunctionDiscrete(
                 'slight', hazard_imls,
                 [0.0, 0.771, 0.95, 0.989, 0.997, 0.999, 1., 1.]),
@@ -647,7 +648,7 @@ class ClassicalDamageTestCase(unittest.TestCase):
             scientific.FragilityFunctionDiscrete(
                 'complete', hazard_imls,
                 [0, 0.097, 0.414, 0.661, 0.806, 0.887, 0.933, 0.959]),
-            ], imls=hazard_imls, steps_per_interval=None)
+        ])
         hazard_poes = numpy.array([
             0.999999999997518,
             0.077404949,
@@ -671,7 +672,9 @@ class ClassicalDamageTestCase(unittest.TestCase):
             [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6,
              0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1, 1.05, 1.1, 1.15, 1.2,
              1.25, 1.3, 1.35, 1.4])
-        fragility_functions = scientific.FragilityFunctionList([
+        fragility_functions = scientific.FragilityFunctionList(
+            [], imls=hazard_imls, steps_per_interval=None)
+        fragility_functions.extend([
             scientific.FragilityFunctionContinuous(
                 'slight', 0.160, 0.104),
             scientific.FragilityFunctionContinuous(
@@ -680,7 +683,7 @@ class ClassicalDamageTestCase(unittest.TestCase):
                 'extreme', 0.400, 0.300),
             scientific.FragilityFunctionContinuous(
                 'complete', 0.600, 0.480),
-            ], imls=hazard_imls, steps_per_interval=None)
+        ])
         hazard_poes = numpy.array([
             0.5917765421,
             0.2482053921,

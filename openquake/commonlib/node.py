@@ -1,20 +1,20 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 """
 This module defines a Node class, together with a few conversion
@@ -142,9 +142,10 @@ generator. Finally, nodes containing lazy nodes will not be pickleable.
 """
 from openquake.baselib.python3compat import configparser, with_metaclass
 
-import sys
-import pprint as pp
 import io
+import sys
+import copy
+import pprint as pp
 from contextlib import contextmanager
 from openquake.baselib.python3compat import raise_, exec_
 from openquake.commonlib.writers import StreamingXMLWriter
@@ -263,6 +264,9 @@ class Node(object):
                 'A branch node cannot have a value, got %r' % self.text)
 
     def __getattr__(self, name):
+        if name.startswith('_'):
+            # do the magic only for public names
+            raise AttributeError(name)
         for node in self.nodes:
             if striptag(node.tag) == name:
                 return node
@@ -355,6 +359,15 @@ class Node(object):
 
     if sys.version > '3':
         __bool__ = __nonzero__
+
+    def __deepcopy__(self, memo):
+        new = object.__new__(self.__class__)
+        new.tag = self.tag
+        new.attrib = self.attrib.copy()
+        new.text = copy.copy(self.text)
+        new.nodes = [copy.deepcopy(n, memo) for n in self.nodes]
+        new.lineno = self.lineno
+        return new
 
     def __getstate__(self):
         return dict((slot, getattr(self, slot))

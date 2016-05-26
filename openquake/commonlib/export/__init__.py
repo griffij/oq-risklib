@@ -1,23 +1,29 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 from openquake.baselib.general import import_all, CallableDict
 from openquake.commonlib.writers import write_csv
+
+
+class MissingExporter(Exception):
+    """
+    Raised when there is not exporter for the given pair (dskey, fmt)
+    """
 
 
 def export_csv(ekey, dstore):
@@ -39,6 +45,24 @@ def export_csv(ekey, dstore):
     return [write_csv(dstore.export_path(name), array)]
 
 
-export = CallableDict()
+def dispatch_on_colon(ekey, dstore):
+    """
+    If the datastore key contains a colon, i.e. it is of the form
+    dskey:spec, then call `export(('<dskey>:', fmt), dstore, spec)`.
+
+    :param ekey:
+        export key of the form (k0, ext) with k0 of the form <dskey>:<spec>
+    :param dstore:
+        datastore instance
+
+    This function is called only for ekey not present in the datastore.
+    """
+    if ':' not in ekey[0]:
+        raise MissingExporter(ekey)
+    dkey, spec = ekey[0].split(':', 1)
+    return export((dkey + ':', ekey[1]), dstore, spec)
+
+
+export = CallableDict(keymissing=dispatch_on_colon)
 
 import_all('openquake.commonlib.export')

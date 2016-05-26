@@ -1,87 +1,73 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
-
-import os
-import logging
+import numpy
 
 from openquake.baselib.general import AccumDict
-from openquake.commonlib import readinput, parallel, logictree, datastore
-from openquake.calculators import base
+from openquake.commonlib import parallel, datastore
+from openquake.calculators import base, classical_risk
 
 
 @parallel.litetask
-def classical_damage(riskinputs, riskmodel, rlzs_assoc, monitor):
+def classical_damage(riskinput, riskmodel, rlzs_assoc, monitor):
     """
     Core function for a classical damage computation.
 
-    :param riskinputs:
-        a list of :class:`openquake.risklib.riskinput.RiskInput` objects
+    :param riskinput:
+        a :class:`openquake.risklib.riskinput.RiskInput` object
     :param riskmodel:
-        a :class:`openquake.risklib.riskinput.RiskModel` instance
+        a :class:`openquake.risklib.riskinput.CompositeRiskModel` instance
     :param rlzs_assoc:
         associations (trt_id, gsim) -> realizations
     :param monitor:
-        :class:`openquake.baselib.performance.PerformanceMonitor` instance
+        :class:`openquake.baselib.performance.Monitor` instance
     :returns:
         a nested dictionary rlz_idx -> asset -> <damage array>
     """
-    logging.info('Process %d, considering %d risk input(s) of weight %d',
-                 os.getpid(), len(riskinputs),
-                 sum(ri.weight for ri in riskinputs))
     with monitor:
         result = {i: AccumDict() for i in range(len(rlzs_assoc))}
-        for out_by_rlz in riskmodel.gen_outputs(
-                riskinputs, rlzs_assoc, monitor):
-            for out in out_by_rlz:
-                result[out.hid] += dict(zip(out.assets, out.damages))
+        for out_by_lr in riskmodel.gen_outputs(
+                riskinput, rlzs_assoc, monitor):
+            for (l, r), out in sorted(out_by_lr.items()):
+                ordinals = [a.ordinal for a in out.assets]
+                result[r] += dict(zip(ordinals, out.damages))
     return result
 
 
 @base.calculators.add('classical_damage')
-class ClassicalDamageCalculator(base.RiskCalculator):
+class ClassicalDamageCalculator(classical_risk.ClassicalRiskCalculator):
     """
     Scenario damage calculator
     """
-    core_func = classical_damage
-    damages_by_rlz = datastore.persistent_attribute('damages_by_rlz')
+    core_task = classical_damage
+    damages = datastore.persistent_attribute('damages-rlzs')
 
-    def pre_execute(self):
+    def check_poes(self, curves_by_trt_gsim):
         """
-        Read the curves and build the riskinputs.
+        Raise an error if one PoE = 1, since it would produce a log(0) in
+        :class:`openquake.risklib.scientific.annual_frequency_of_exceedence`
         """
-        super(ClassicalDamageCalculator, self).pre_execute()
-
-        logging.info('Reading hazard curves from file')
-        sites, hcurves_by_imt = readinput.get_hcurves(self.oqparam)
-
-        with self.monitor('assoc_assets_sites'):
-            sitecol, assets_by_site = self.assoc_assets_sites(sites)
-        num_assets = sum(len(assets) for assets in assets_by_site)
-        num_sites = len(sitecol)
-        logging.info('Associated %d assets to %d sites', num_assets, num_sites)
-
-        logging.info('Preparing the risk input')
-        self.riskinputs = self.build_riskinputs(
-            {(0, 'FromFile'): hcurves_by_imt})
-        fake_rlz = logictree.Realization(
-            value=('FromFile',), weight=1, lt_path=('',),
-            ordinal=0, lt_uid=('*',))
-        self.rlzs_assoc = logictree.RlzsAssoc([fake_rlz])
+        for key, curves in curves_by_trt_gsim.items():
+            for imt in self.oqparam.imtls:
+                for sid, poes in enumerate(curves[imt]):
+                    if (poes == 1).any():
+                        raise ValueError('Found a PoE=1 for site_id=%d, %s'
+                                         % (sid, imt))
 
     def post_execute(self, result):
         """
@@ -90,4 +76,10 @@ class ClassicalDamageCalculator(base.RiskCalculator):
         :param result:
             a dictionary asset -> fractions per damage state
         """
-        self.damages_by_rlz = result
+        damages_dt = numpy.dtype([(ds, numpy.float32)
+                                  for ds in self.riskmodel.damage_states])
+        damages = numpy.zeros((self.N, self.R), damages_dt)
+        for r in result:
+            for aid, fractions in result[r].items():
+                damages[aid, r] = tuple(fractions)
+        self.damages = damages

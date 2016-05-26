@@ -1,20 +1,20 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 """
 Here is a minimal example of usage:
@@ -90,8 +90,8 @@ class Parser(object):
         nodefaults = len(args) - len(defaults)
         alldefaults = (NODEFAULT,) * nodefaults + defaults
         self.argdict = OrderedDict(zip(args, alldefaults))
-        self.parentparser = get_parentparser(
-            parentparser, description=func.__doc__, help=help)
+        self.description = descr = func.__doc__ if func.__doc__ else None
+        self.parentparser = get_parentparser(parentparser, descr, help)
         self.names = set()
         self.all_arguments = []
         self._group = self.parentparser
@@ -116,20 +116,23 @@ class Parser(object):
         self.names.add(name)
         self._argno += 1
 
-    def arg(self, name, help, type=None, choices=None, metavar=None):
+    def arg(self, name, help, type=None, choices=None, metavar=None,
+            nargs=None):
         """Describe a positional argument"""
-        kw = dict(help=help, type=type, choices=choices, metavar=metavar)
+        kw = dict(help=help, type=type, choices=choices, metavar=metavar,
+                  nargs=nargs)
         default = self.argdict[name]
         if default is not NODEFAULT:
-            kw['nargs'] = '?'
+            kw['nargs'] = nargs or '?'
             kw['default'] = default
-            kw['help'] = kw['help'] + ' [default: %s]' % str(default)
+            kw['help'] = kw['help'] + ' [default: %s]' % repr(default)
         self._add(name, name, **kw)
 
     def opt(self, name, help, abbrev=None,
-            type=None, choices=None, metavar=None):
+            type=None, choices=None, metavar=None, nargs=None):
         """Describe an option"""
-        kw = dict(help=help, type=type, choices=choices, metavar=metavar)
+        kw = dict(help=help, type=type, choices=choices, metavar=metavar,
+                  nargs=nargs)
         default = self.argdict[name]
         if default is not NODEFAULT:
             kw['default'] = default
@@ -173,7 +176,8 @@ class Parser(object):
         return self.parentparser.format_help()
 
 
-def compose(parsers, name='main', description=None, help=True):
+def compose(parsers, name='main', description=None, prog=None,
+            version=None):
     """
     Collects together different arguments parsers and builds a single
     Parser dispatching on the subparsers depending on
@@ -181,14 +185,31 @@ def compose(parsers, name='main', description=None, help=True):
 
     :param parsers: a list of Parser instances
     :param name: the name of the composed parser
+    :param description: description of the composed parser
+    :param prog: name of the script printed in the usage message
+    :param version: version of the script printed with --version
     """
     assert len(parsers) >= 1, parsers
     parentparser = argparse.ArgumentParser(
-        description=description, add_help=help)
+        description=description, version=version, add_help=False)
     subparsers = parentparser.add_subparsers(
-        help='available subcommands (see sub help)')
-    for p in parsers:
-        subp = subparsers.add_parser(p.name)
+        help='available subcommands; use %s help <cmd>' % prog,
+        prog=prog)
+
+    def gethelp(cmd=None):
+        if cmd is None:
+            print(parentparser.format_help())
+            return
+        subp = subparsers._name_parser_map.get(cmd)
+        if subp is None:
+            print('No help for unknown command %r' % cmd)
+        else:
+            print(subp.format_help())
+    help_parser = Parser(gethelp, 'help', help=False)
+    progname = '%s ' % prog if prog else ''
+    help_parser.arg('cmd', progname + 'subcommand')
+    for p in parsers + [help_parser]:
+        subp = subparsers.add_parser(p.name, description=p.description)
         for args, kw in p.all_arguments:
             subp.add_argument(*args, **kw)
         subp.set_defaults(_func=p.func)

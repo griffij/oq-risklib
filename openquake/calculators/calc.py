@@ -1,20 +1,20 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 from __future__ import division
 import collections
@@ -23,8 +23,11 @@ import operator
 
 import numpy
 
+from openquake.baselib.general import get_array
 from openquake.hazardlib.imt import from_string
 from openquake.hazardlib.calc import gmf, filters
+from openquake.hazardlib.probability_map import (
+    ProbabilityCurve, ProbabilityMap)
 from openquake.hazardlib.site import SiteCollection
 from openquake.commonlib.readinput import \
     get_gsims, get_rupture, get_correl_model, get_imts
@@ -76,9 +79,6 @@ def gen_ruptures(sources, site_coll, maximum_distance, monitor):
                 if r_sites is None:
                     continue
             yield SourceRuptureSites(src, rupture, r_sites)
-    filtsources_mon.flush()
-    genruptures_mon.flush()
-    filtruptures_mon.flush()
 
 
 def gen_ruptures_for_site(site, sources, maximum_distance, monitor):
@@ -139,7 +139,7 @@ def compute_hazard_maps(curves, imls, poes):
         Value(s) on which to interpolate a hazard map from the input
         ``curves``. Can be an array-like or scalar value (for a single PoE).
     :returns:
-        An array of shape P x N, where N is the number of curves and P the
+        An array of shape N x P, where N is the number of curves and P the
         number of poes.
     """
     curves = numpy.array(curves)
@@ -185,7 +185,7 @@ def compute_hazard_maps(curves, imls, poes):
 # #########################  GMF->curves #################################### #
 
 # NB (MS): the approach used here will not work for non-poissonian models
-def gmvs_to_haz_curve(gmvs, imls, invest_time, duration):
+def _gmvs_to_haz_curve(gmvs, imls, invest_time, duration):
     """
     Given a set of ground motion values (``gmvs``) and intensity measure levels
     (``imls``), compute hazard curve probabilities of exceedance.
@@ -222,24 +222,63 @@ def gmvs_to_haz_curve(gmvs, imls, invest_time, duration):
     return poes
 
 
+def gmvs_to_poe_map(gmvs_by_sid, imtls, invest_time, duration):
+    """
+    Convert a dictionary sid -> gmva into a ProbabilityMap
+    """
+    pmap = ProbabilityMap()
+    for sid in gmvs_by_sid:
+        data = []
+        for imti, imt in enumerate(imtls):
+            gmvs = get_array(gmvs_by_sid[sid], imti=imti)['gmv']
+            data.append(
+                _gmvs_to_haz_curve(gmvs, imtls[imt], invest_time, duration))
+        # the array underlying the ProbabilityCurve has size (num_levels, 1)
+        array = numpy.concatenate(data).reshape(-1, 1)
+        pmap[sid] = ProbabilityCurve(array)
+    return pmap
+
+
 # ################## utilities for classical calculators ################ #
 
-def make_uhs(maps):
+def get_imts_periods(imtls):
+    """
+    Returns a list of IMT strings and a list of periods. There is an element
+    for each IMT of type Spectral Acceleration, including PGA which is
+    considered an alias for SA(0.0). The lists are sorted by period.
+
+    :param imtls: a set of intensity measure type strings
+    :returns: a list of IMT strings and a list of periods
+    """
+    getperiod = operator.itemgetter(1)
+    imts = sorted((from_string(imt) for imt in imtls
+                   if imt.startswith('SA') or imt == 'PGA'), key=getperiod)
+    return map(str, imts), [imt[1] or 0.0 for imt in imts]
+
+
+def make_uhs(maps, imtls, poes):
     """
     Make Uniform Hazard Spectra curves for each location.
 
-    It is assumed that the `lons` and `lats` for each of the ``maps`` are
+    It is assumed that the `lons` and `lats` for each of the `maps` are
     uniform.
 
     :param maps:
-        A composite array with shape N x P, where N is the number of
+        a composite array with shape N x P, where N is the number of
         sites and P is the number of poes in the hazard maps
+    :param imtls:
+        a dictionary of intensity measure types and levels
+    :param poes:
+        a sequence of PoEs for the underlying hazard maps
     :returns:
-        an array N x I x P where I the number of intensity measure types of
-        kind SA (with PGA = SA(0)), containing the hazard maps
+        an composite array containing N uniform hazard maps
     """
-    sorted_imts = list(map(str, sorted(
-        from_string(imt) for imt in maps.dtype.fields
-        if imt.startswith('SA') or imt == 'PGA')))
-    hmaps = numpy.array([maps[imt] for imt in sorted_imts])  # I * N * P
-    return hmaps.transpose(1, 0, 2)  # N * I * P
+    imts, _ = get_imts_periods(imtls)
+    imts_dt = numpy.dtype([(imt, F32) for imt in imts])
+    uhs_dt = numpy.dtype([('poe~%s' % poe, imts_dt) for poe in poes])
+    N = len(maps)
+    uhs = numpy.zeros(N, uhs_dt)
+    for poe in poes:
+        for imt in imts:
+            uhs['poe~%s' % poe][imt] = maps['%s~%s' % (imt, poe)]
+    return uhs

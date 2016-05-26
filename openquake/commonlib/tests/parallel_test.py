@@ -1,3 +1,21 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 import unittest
 import numpy
 from openquake.commonlib import parallel
@@ -16,7 +34,7 @@ def get_len(data, monitor):
 
 
 class TaskManagerTestCase(unittest.TestCase):
-    monitor = parallel.DummyMonitor()
+    monitor = parallel.Monitor()
 
     def test_apply_reduce(self):
         res = parallel.apply_reduce(
@@ -51,12 +69,12 @@ class TaskManagerTestCase(unittest.TestCase):
         self.assertEqual(get_len.__code__.co_varnames, ('data', 'monitor'))
 
         # pickling/unpickling behavior
-        mon = parallel.PerformanceMonitor('test')
+        mon = parallel.Monitor('test')
         pik_args = parallel.Pickled('ab'), parallel.Pickled(mon)
         res = get_len(*pik_args).unpickle()
 
         # flushing error
-        self.assertIn('PerformanceMonitor(\'test\').flush() must not be called'
+        self.assertIn('Monitor(\'test\').flush() must not be called'
                       ' by get_len!', res[0])
         self.assertEqual(res[1], RuntimeError)
         self.assertEqual(res[2].operation, mon.operation)

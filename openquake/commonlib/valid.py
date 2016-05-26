@@ -1,20 +1,20 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2013-2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2013-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 """
 Validation library for the engine, the desktop tools, and anything else
@@ -30,6 +30,7 @@ from decimal import Decimal
 import numpy
 
 from openquake.baselib.python3compat import with_metaclass
+from openquake.baselib import hdf5
 from openquake.hazardlib import imt, scalerel, gsim
 from openquake.baselib.general import distinct
 
@@ -46,6 +47,10 @@ def gsim(value, **kwargs):
     >>> gsim('BooreAtkinson2011')
     'BooreAtkinson2011()'
     """
+    if value == 'FromFile':
+        return 'FromFile'
+    elif value.endswith('()'):
+        value = value[:-2]  # strip parenthesis
     try:
         gsim_class = GSIM[value]
     except KeyError:
@@ -138,7 +143,32 @@ class Choices(Choice):
                     val, self.choices))
         return tuple(values)
 
-export_formats = Choices('', 'xml', 'csv', 'geojson')
+export_formats = Choices('', 'xml', 'geojson', 'txt', 'csv')
+
+
+def hazard_id(value):
+    """
+    >>> hazard_id('')
+    ()
+    >>> hazard_id('-1')
+    (-1,)
+    >>> hazard_id('42')
+    (42,)
+    >>> hazard_id('42,3')
+    (42, 3)
+    >>> hazard_id('42,3,4')
+    (42, 3, 4)
+    >>> hazard_id('42:3')
+    Traceback (most recent call last):
+       ...
+    ValueError: Invalid hazard_id '42:3'
+    """
+    if not value:
+        return ()
+    try:
+        return tuple(map(int, value.split(',')))
+    except:
+        raise ValueError('Invalid hazard_id %r' % value)
 
 
 class Regex(object):
@@ -159,20 +189,34 @@ name = Regex(r'^[a-zA-Z_]\w*$')
 
 name_with_dashes = Regex(r'^[a-zA-Z_][\w\-]*$')
 
+
+class SimpleId(object):
+    """
+    Check if the given value is a valid ID.
+
+    :param length: maximum length of the ID
+    :param regex: accepted characters
+    """
+    def __init__(self, length, regex=r'^[\w_\-]+$'):
+        self.length = length
+        self.regex = regex
+        self.__name__ = 'SimpleId(%d, %s)' % (length, regex)
+
+    def __call__(self, value):
+        if len(value) > self.length:
+            raise ValueError('The ID %r is longer than %d character' %
+                             (value, self.length))
+        if re.match(self.regex, value):
+            return value
+        raise ValueError(
+            'Invalid ID %r: the only accepted chars are a-zA-Z0-9_-' % value)
+
 MAX_ID_LENGTH = 100
+ASSET_ID_LENGTH = 100
 
-
-def simple_id(value):
-    """
-    Check the source id; the only accepted chars are `a-zA-Z0-9_-`
-    """
-    if len(value) > MAX_ID_LENGTH:
-        raise ValueError('The ID %r is longer than %d character' %
-                         (value, MAX_ID_LENGTH))
-    if re.match(r'^[\w_\-]+$', value):
-        return value
-    raise ValueError(
-        'Invalid ID %r: the only accepted chars are a-zA-Z0-9_-' % value)
+simple_id = SimpleId(MAX_ID_LENGTH)
+asset_id = SimpleId(ASSET_ID_LENGTH)
+source_id = SimpleId(MAX_ID_LENGTH, r'^[\w\.\-_]+$')
 
 
 class FloatRange(object):
@@ -193,8 +237,8 @@ class FloatRange(object):
 
 
 def not_empty(value):
-    """Check that the string is not empty"""
-    if value == '':
+    """Check that the string is not all blanks"""
+    if value is None or value.strip() == '':
         raise ValueError('Got an empty string')
     return value
 
@@ -497,6 +541,24 @@ def IML(value, IMT, minIML=None, maxIML=None, imlUnit=None):
     return (imt_str, imls, min_iml, max_iml, imlUnit)
 
 
+def intensity_measure_type(value):
+    """
+    Make sure `value` is a valid intensity measure type and return it
+    in a normalized form
+
+    >>> intensity_measure_type('SA(0.10)')  # NB: strips the trailing 0
+    'SA(0.1)'
+    >>> intensity_measure_type('SA')  # this is invalid
+    Traceback (most recent call last):
+      ...
+    ValueError: Invalid IMT: 'SA'
+    """
+    try:
+        return str(imt.from_string(value))
+    except:
+        raise ValueError('Invalid IMT: %r' % value)
+
+
 def intensity_measure_types(value):
     """
     :param value: input string
@@ -609,6 +671,26 @@ def dictionary(value):
     except:
         raise ValueError('%r is not a valid Python dictionary' % value)
     return dic
+
+
+def floatdict(value):
+    """
+    :param value:
+        input string corresponding to a literal Python number or dictionary
+    :returns:
+        a Python dictionary key -> number
+
+    >>> floatdict("200")
+    {'default': 200}
+
+    >>> text = "{'active shallow crust': 250., 'default': 200}"
+    >>> sorted(floatdict(text).items())
+    [('active shallow crust', 250.0), ('default', 200)]
+    """
+    value = ast.literal_eval(value)
+    if isinstance(value, (int, float)):
+        return {'default': value}
+    return dict(value)
 
 
 # ########################### SOURCES/RUPTURES ############################# #
@@ -826,7 +908,7 @@ class MetaParamSet(type):
 
 
 # used in commonlib.oqvalidation
-class ParamSet(with_metaclass(MetaParamSet)):
+class ParamSet(with_metaclass(MetaParamSet, hdf5.LiteralAttrs)):
     """
     A set of valid interrelated parameters. Here is an example
     of usage:
@@ -836,7 +918,7 @@ class ParamSet(with_metaclass(MetaParamSet)):
     ...     b = Param(positivefloat)
     ...
     ...     def is_valid_not_too_big(self):
-    ...         "The sum of a and b must be under 10. "
+    ...         "The sum of a and b must be under 10: a={a} and b={b}"
     ...         return self.a + self.b < 10
 
     >>> mp = MyParams(a='1', b='7.2')
@@ -846,10 +928,7 @@ class ParamSet(with_metaclass(MetaParamSet)):
     >>> MyParams(a='1', b='9.2').validate()
     Traceback (most recent call last):
     ...
-    ValueError: The sum of a and b must be under 10.
-    Got:
-    a=1
-    b=9.2
+    ValueError: The sum of a and b must be under 10: a=1 and b=9.2
 
     The constrains are applied in lexicographic order. The attribute
     corresponding to a Param descriptor can be set as usual:
@@ -872,6 +951,23 @@ class ParamSet(with_metaclass(MetaParamSet)):
     params = {}
 
     @classmethod
+    def check(cls, dic):
+        """
+        Convert a dictionary name->string into a dictionary name->value
+        by converting the string. If the name does not correspond to a
+        known parameter, just ignore it and print a warning.
+        """
+        res = {}
+        for name, text in dic.items():
+            try:
+                p = getattr(cls, name)
+            except AttributeError:
+                logging.warn('Ignored unknown parameter %s', name)
+            else:
+                res[name] = p.validator(text)
+        return res
+
+    @classmethod
     def from_(cls, dic):
         """
         Build a new ParamSet from a dictionary of string-valued parameters
@@ -889,7 +985,8 @@ class ParamSet(with_metaclass(MetaParamSet)):
         the underlying value.
         """
         dic = self.__dict__
-        return [(k, repr(dic[k])) for k in sorted(dic)]
+        return [(k, repr(dic[k])) for k in sorted(dic)
+                if not k.startswith('_')]
 
     def __init__(self, **names_vals):
         for name, val in names_vals.items():
@@ -918,17 +1015,10 @@ class ParamSet(with_metaclass(MetaParamSet)):
                   if valid.startswith('is_valid_')]
         for is_valid in valids:
             if not is_valid():
-                dump = '\n'.join('%s=%s' % (n, v)
-                                 for n, v in sorted(self.__dict__.items()))
                 docstring = is_valid.__doc__.strip()
                 doc = textwrap.fill(docstring.format(**vars(self)))
-                raise ValueError(doc + '\nGot:\n' + dump)
+                raise ValueError(doc)
 
     def __iter__(self):
         for item in sorted(vars(self).items()):
             yield item
-
-    def __repr__(self):
-        names = sorted(n for n in vars(self) if not n.startswith('_'))
-        nameval = ', '.join('%s=%r' % (n, getattr(self, n)) for n in names)
-        return '<%s %s>' % (self.__class__.__name__, nameval)

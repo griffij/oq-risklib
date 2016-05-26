@@ -1,11 +1,28 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 import mock
+import pickle
 import unittest
 import numpy
 from openquake.baselib.general import writetmp
-from openquake.commonlib import readinput, readers
+from openquake.commonlib import readinput, writers, riskmodels
 from openquake.risklib import riskinput
-from openquake.calculators import event_based
-from openquake.calculators.tests import get_datastore
 from openquake.qa_tests_data.event_based_risk import case_2
 
 
@@ -32,72 +49,41 @@ class RiskInputTestCase(unittest.TestCase):
         cls.oqparam.insured_losses = True
         cls.sitecol, cls.assets_by_site = readinput.get_sitecol_assets(
             cls.oqparam, readinput.get_exposure(cls.oqparam))
-        cls.riskmodel = readinput.get_risk_model(cls.oqparam)
+        rmdict = riskmodels.get_risk_models(cls.oqparam)
+        cls.riskmodel = readinput.get_risk_model(cls.oqparam, rmdict)
 
     def test_assetcol(self):
         expected = writetmp('''\
-asset_ref:|S100:,site_id:uint32:,taxonomy:uint32:,fatalities:float64:,structural:float64:,deductible~structural:float64:,insurance_limit~structural:float64:
-a0,0,1,10,3000,.25,1.0
-a1,1,0,20,2000,0.25,0.5
-a2,2,2,30,1000,0.2,0.8
-a3,2,1,0,5000,2.0,6.0
-a4,3,1,50,500000,2.0,6.0
+idx:uint32,lon,lat,site_id:uint32,taxonomy:uint32:,number,area,occupants:float64:,structural:float64:,deductible~structural:float64:,insurance_limit~structural:float64:
+0,8.12985001E+01,2.91098003E+01,0,1,3.00000000E+00,1.00000000E+01,1.00000000E+01,1.00000000E+02,2.50000000E+01,1.00000000E+02
+1,8.30822983E+01,2.79006004E+01,1,0,5.00000000E+02,1.00000000E+01,2.00000000E+01,4.00000000E-01,1.00000000E-01,2.00000000E-01
 ''')
-        assetcol = riskinput.build_asset_collection(self.assets_by_site)
+        assetcol = riskinput.AssetCollection(self.assets_by_site, None, None)
         numpy.testing.assert_equal(
-            assetcol, readers.read_composite_array(expected))
+            assetcol.array, writers.read_composite_array(expected))
 
-    def test_get_all(self):
+        # pickleability
+        pickle.loads(pickle.dumps(assetcol))
+
+    def test_get_hazard(self):
         self.assertEqual(
             list(self.riskmodel.get_imt_taxonomies()),
-            [('PGA', ['RM']), ('SA(0.2)', ['RC']), ('SA(0.5)', ['W'])])
-        self.assertEqual(len(self.sitecol), 4)
-        hazard_by_site = [{}] * 4
+            [('PGA', set(['RM'])), ('SA(0.2)', set(['RC'])),
+             ('SA(0.5)', set(['W']))])
+        self.assertEqual(len(self.sitecol), 2)
+        hazard_by_site = [{}] * 2
 
         ri_PGA = self.riskmodel.build_input(
             'PGA', hazard_by_site, self.assets_by_site, {})
-        assets, hazards, epsilons = ri_PGA.get_all(rlzs_assoc)
-        self.assertEqual([a.id for a in assets], ['a0', 'a3', 'a4'])
-        self.assertEqual(set(a.taxonomy for a in assets), set(['RM']))
-        self.assertEqual(epsilons, [None, None, None])
+        haz = ri_PGA.get_hazard(rlzs_assoc)
+        self.assertEqual(len(haz), 2)
 
         ri_SA_02 = self.riskmodel.build_input(
             'SA(0.2)', hazard_by_site, self.assets_by_site, {})
-        assets, hazards, epsilons = ri_SA_02.get_all(rlzs_assoc)
-        self.assertEqual([a.id for a in assets], ['a1'])
-        self.assertEqual(set(a.taxonomy for a in assets), set(['RC']))
-        self.assertEqual(epsilons, [None])
+        haz = ri_SA_02.get_hazard(rlzs_assoc)
+        self.assertEqual(len(haz), 2)
 
         ri_SA_05 = self.riskmodel.build_input(
             'SA(0.5)', hazard_by_site, self.assets_by_site, {})
-        assets, hazards, epsilons = ri_SA_05.get_all(rlzs_assoc)
-        self.assertEqual([a.id for a in assets], ['a2'])
-        self.assertEqual(set(a.taxonomy for a in assets), set(['W']))
-        self.assertEqual(epsilons, [None])
-
-    def test_from_ruptures(self):
-        oq = self.oqparam
-        correl_model = readinput.get_correl_model(oq)
-        rupcalc = event_based.EventBasedRuptureCalculator(oq)
-        rupcalc.run()
-        dstore = get_datastore(rupcalc)
-
-        # this is case with a single SES collection
-        ses_ruptures = list(dstore['sescollection'][0].values())
-
-        gsims_by_trt_id = rupcalc.rlzs_assoc.gsims_by_trt_id
-
-        eps = riskinput.make_eps(
-            self.assets_by_site, len(ses_ruptures), oq.master_seed,
-            oq.asset_correlation)
-
-        [ri] = self.riskmodel.build_inputs_from_ruptures(
-            self.sitecol, ses_ruptures, gsims_by_trt_id, oq.truncation_level,
-            correl_model, eps, hint=1)
-
-        assets, hazards, epsilons = ri.get_all(rlzs_assoc, self.assets_by_site)
-        self.assertEqual([a.id for a in assets],
-                         [b'a0', b'a1', b'a2', b'a3', b'a4'])
-        self.assertEqual(set(a.taxonomy for a in assets),
-                         set(['RM', 'RC', 'W']))
-        self.assertEqual(list(map(len, epsilons)), [20] * 5)
+        haz = ri_SA_05.get_hazard(rlzs_assoc)
+        self.assertEqual(len(haz), 2)

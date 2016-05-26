@@ -1,20 +1,20 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014-2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 from __future__ import division
 import math
@@ -22,9 +22,10 @@ from nose.plugins.attrib import attr
 
 import numpy.testing
 
-from openquake.baselib.general import groupby
-from openquake.commonlib.datastore import DataStore
+from openquake.baselib.general import get_array
+from openquake.commonlib.datastore import read
 from openquake.commonlib.util import max_rel_diff_index
+from openquake.commonlib.export import export
 from openquake.calculators.tests import CalculatorTestCase
 from openquake.qa_tests_data.event_based import (
     blocksize, case_1, case_2, case_4, case_5, case_6, case_7, case_12,
@@ -55,9 +56,10 @@ def joint_prob_of_occurrence(gmvs_site_1, gmvs_site_2, gmv, time_span,
         the interval to consider
     """
     assert len(gmvs_site_1) == len(gmvs_site_2)
-
     half_delta = float(delta_gmv) / 2
-    gmv_close = lambda v: (gmv - half_delta <= v <= gmv + half_delta)
+
+    def gmv_close(v):
+        return (gmv - half_delta <= v <= gmv + half_delta)
     count = 0
     for gmv_site_1, gmv_site_2 in zip(gmvs_site_1, gmvs_site_2):
         if gmv_close(gmv_site_1) and gmv_close(gmv_site_2):
@@ -79,17 +81,11 @@ class EventBasedTestCase(CalculatorTestCase):
             self.run_calc(case.__file__, 'job.ini')
             oq = self.calc.oqparam
             self.assertEqual(list(oq.imtls), ['PGA'])
-            dstore = DataStore(self.calc.datastore.calc_id)
-            gmf_by_rupid = groupby(
-                dstore['gmfs/col00'].value,
-                lambda row: row['idx'],
-                lambda rows: [row['BooreAtkinson2008']['PGA'] for row in rows])
+            dstore = read(self.calc.datastore.calc_id)
+            gmvs = dstore['gmf_data/0000'].value
             dstore.close()
-            gmvs_site_1 = []
-            gmvs_site_2 = []
-            for rupid, gmf in gmf_by_rupid.items():
-                gmvs_site_1.append(gmf[0])
-                gmvs_site_2.append(gmf[1])
+            gmvs_site_1 = get_array(gmvs, sid=0, imti=0)['gmv']
+            gmvs_site_2 = get_array(gmvs, sid=1, imti=0)['gmv']
             joint_prob_0_5 = joint_prob_of_occurrence(
                 gmvs_site_1, gmvs_site_2, 0.5, oq.investigation_time,
                 oq.ses_per_logic_tree_path)
@@ -103,36 +99,51 @@ class EventBasedTestCase(CalculatorTestCase):
 
     @attr('qa', 'hazard', 'event_based')
     def test_blocksize(self):
-        out = self.run_calc(blocksize.__file__, 'job.ini', concurrent_tasks=4,
-                            exports='csv')
-        [fname] = out['gmfs', 'csv']
-        self.assertEqualFiles('expected/0-ChiouYoungs2008.csv',
+        # here the <AreaSource 1> is light and not split
+        out = self.run_calc(blocksize.__file__, 'job.ini',
+                            concurrent_tasks='3', exports='txt')
+        [fname] = out['gmf_data', 'txt']
+        self.assertEqualFiles('expected/0-ChiouYoungs2008.txt',
                               fname, sorted)
 
-        out = self.run_calc(blocksize.__file__, 'job.ini', concurrent_tasks=8,
-                            exports='csv')
-        [fname] = out['gmfs', 'csv']
-        self.assertEqualFiles('expected/0-ChiouYoungs2008.csv',
+        # here the <AreaSource 1> is heavy and split
+        out = self.run_calc(blocksize.__file__, 'job.ini',
+                            concurrent_tasks='4', exports='txt')
+        [fname] = out['gmf_data', 'txt']
+        self.assertEqualFiles('expected/0-ChiouYoungs2008.txt',
                               fname, sorted)
 
     @attr('qa', 'hazard', 'event_based')
     def test_case_1(self):
-        out = self.run_calc(case_1.__file__, 'job.ini', exports='csv')
+        out = self.run_calc(case_1.__file__, 'job.ini', exports='csv,txt,xml')
 
-        [fname] = out['gmfs', 'csv']
+        [fname] = out['gmf_data', 'txt']
         self.assertEqualFiles(
-            'expected/0-SadighEtAl1997.csv', fname, sorted)
+            'expected/0-SadighEtAl1997.txt', fname, sorted)
 
         [fname] = out['hcurves', 'csv']
         self.assertEqualFiles(
             'expected/hazard_curve-smltp_b1-gsimltp_b1.csv', fname)
 
+        [fname] = out['hcurves', 'xml']
+        self.assertEqualFiles(
+            'expected/hazard_curve-smltp_b1-gsimltp_b1-PGA.xml', fname)
+
+    @attr('qa', 'hazard', 'event_based')
+    def test_minimum_intensity(self):
+        out = self.run_calc(case_2.__file__, 'job.ini', exports='txt',
+                            minimum_intensity='0.4')
+
+        [fname] = out['gmf_data', 'txt']
+        self.assertEqualFiles(
+            'expected/minimum-intensity-SadighEtAl1997.txt', fname, sorted)
+
     @attr('qa', 'hazard', 'event_based')
     def test_case_2(self):
-        out = self.run_calc(case_2.__file__, 'job.ini', exports='csv')
-        [fname] = out['gmfs', 'csv']
+        out = self.run_calc(case_2.__file__, 'job.ini', exports='txt,csv')
+        [fname] = out['gmf_data', 'txt']
         self.assertEqualFiles(
-            'expected/SadighEtAl1997.csv', fname, sorted)
+            'expected/SadighEtAl1997.txt', fname, sorted)
 
         [fname] = out['hcurves', 'csv']
         self.assertEqualFiles(
@@ -140,24 +151,23 @@ class EventBasedTestCase(CalculatorTestCase):
 
     @attr('qa', 'hazard', 'event_based')
     def test_case_2bis(self):  # oversampling
-        out = self.run_calc(case_2.__file__, 'job_2.ini', exports='csv,xml')
-        ltr = out['gmfs', 'csv']  # 2 realizations, 1 TRT
+        out = self.run_calc(case_2.__file__, 'job_2.ini',
+                            exports='txt,csv,xml')
+        ltr = out['gmf_data', 'txt']  # 2 realizations, 1 TRT
         self.assertEqualFiles(
-            'expected/gmf-smltp_b1-gsimltp_b1-ltr_0.csv', ltr[0])
+            'expected/gmf-smltp_b1-gsimltp_b1-ltr_0.txt', ltr[0])
         self.assertEqualFiles(
-            'expected/gmf-smltp_b1-gsimltp_b1-ltr_1.csv', ltr[1])
+            'expected/gmf-smltp_b1-gsimltp_b1-ltr_1.txt', ltr[1])
 
-        ltr0 = out['gmfs', 'xml'][0]
+        ltr0 = out['gmf_data', 'xml'][0]
         self.assertEqualFiles('expected/gmf-smltp_b1-gsimltp_b1-ltr_0.xml',
                               ltr0)
 
         ltr = out['hcurves', 'csv']
         self.assertEqualFiles(
             'expected/hc-smltp_b1-gsimltp_b1-ltr_0.csv', ltr[0])
-        # NB: we are testing that the file ltr_1.csv is equal to
-        # ltr_0.csv, as it should be for the hazard curves
         self.assertEqualFiles(
-            'expected/hc-smltp_b1-gsimltp_b1-ltr_0.csv', ltr[1])
+            'expected/hc-smltp_b1-gsimltp_b1-ltr_1.csv', ltr[1])
 
     @attr('qa', 'hazard', 'event_based')
     def test_case_4(self):
@@ -169,14 +179,14 @@ class EventBasedTestCase(CalculatorTestCase):
     @attr('qa', 'hazard', 'event_based')
     def test_case_5(self):
         expected = '''\
-gmf-smltp_b2-gsimltp_@_b2_1_@_@.csv
-gmf-smltp_b2-gsimltp_@_b2_2_@_@.csv
-gmf-smltp_b2-gsimltp_@_b2_3_@_@.csv
-gmf-smltp_b2-gsimltp_@_b2_4_@_@.csv
-gmf-smltp_b2-gsimltp_@_b2_5_@_@.csv
-gmf-smltp_b3-gsimltp_@_@_@_b4_1.csv'''.split()
-        out = self.run_calc(case_5.__file__, 'job.ini', exports='csv')
-        fnames = out['gmfs', 'csv']
+gmf-smltp_b2-gsimltp_@_b2_1_@_@.txt
+gmf-smltp_b2-gsimltp_@_b2_2_@_@.txt
+gmf-smltp_b2-gsimltp_@_b2_3_@_@.txt
+gmf-smltp_b2-gsimltp_@_b2_4_@_@.txt
+gmf-smltp_b2-gsimltp_@_b2_5_@_@.txt
+gmf-smltp_b3-gsimltp_@_@_@_b4_1.txt'''.split()
+        out = self.run_calc(case_5.__file__, 'job.ini', exports='txt')
+        fnames = out['gmf_data', 'txt']
         for exp, got in zip(expected, fnames):
             self.assertEqualFiles('expected/%s' % exp, got, sorted)
 
@@ -192,9 +202,12 @@ gmf-smltp_b3-gsimltp_@_@_@_b4_1.csv'''.split()
         for exp, got in zip(expected, fnames):
             self.assertEqualFiles('expected/%s' % exp, got)
 
+        [fname] = out['realizations', 'csv']
+        self.assertEqualFiles('expected/realizations.csv', fname)
+
     @attr('qa', 'hazard', 'event_based')
     def test_case_7(self):
-        # 2 models x 3 GMPEs, 100 samples * 10 SES
+        # 2 models x 3 GMPEs, 10 samples * 40 SES
         expected = [
             'hazard_curve-mean.csv',
             'quantile_curve-0.1.csv',
@@ -209,7 +222,7 @@ gmf-smltp_b3-gsimltp_@_@_@_b4_1.csv'''.split()
         for imt in mean_cl.dtype.fields:
             reldiff, _index = max_rel_diff_index(
                 mean_cl[imt], mean_eb[imt], min_value=0.1)
-            self.assertLess(reldiff, 0.41)
+            self.assertLess(reldiff, 0.20)
 
     @attr('qa', 'hazard', 'event_based')
     def test_case_12(self):
@@ -220,9 +233,9 @@ gmf-smltp_b3-gsimltp_@_@_@_b4_1.csv'''.split()
 
     @attr('qa', 'hazard', 'event_based')
     def test_case_13(self):
-        out = self.run_calc(case_13.__file__, 'job.ini', exports='csv')
-        [fname] = out['gmfs', 'csv']
-        self.assertEqualFiles('expected/0-BooreAtkinson2008.csv',
+        out = self.run_calc(case_13.__file__, 'job.ini', exports='txt,csv')
+        [fname] = out['gmf_data', 'txt']
+        self.assertEqualFiles('expected/0-BooreAtkinson2008.txt',
                               fname, sorted)
 
         [fname] = out['hcurves', 'csv']
@@ -232,7 +245,6 @@ gmf-smltp_b3-gsimltp_@_@_@_b4_1.csv'''.split()
     @attr('qa', 'hazard', 'event_based')
     def test_case_17(self):  # oversampling
         expected = [
-            'hazard_curve-smltp_b1-gsimltp_@-ltr_0.csv',
             'hazard_curve-smltp_b2-gsimltp_b1-ltr_1.csv',
             'hazard_curve-smltp_b2-gsimltp_b1-ltr_2.csv',
             'hazard_curve-smltp_b2-gsimltp_b1-ltr_3.csv',
@@ -243,14 +255,19 @@ gmf-smltp_b3-gsimltp_@_@_@_b4_1.csv'''.split()
         for exp, got in zip(expected, fnames):
             self.assertEqualFiles('expected/%s' % exp, got, sorted)
 
+        # check that a single rupture file is exported even if there are
+        # several collections
+        [fname] = export(('sescollection', 'xml'), self.calc.datastore)
+        self.assertEqualFiles('expected/ses.xml', fname)
+
     @attr('qa', 'hazard', 'event_based')
     def test_case_18(self):  # oversampling, 3 realizations
         expected = [
-            'gmf-smltp_b1-gsimltp_AB-ltr_0.csv',
-            'gmf-smltp_b1-gsimltp_AB-ltr_1.csv',
-            'gmf-smltp_b1-gsimltp_CF-ltr_2.csv',
+            'gmf-smltp_b1-gsimltp_AB-ltr_0.txt',
+            'gmf-smltp_b1-gsimltp_AB-ltr_1.txt',
+            'gmf-smltp_b1-gsimltp_CF-ltr_2.txt',
         ]
-        out = self.run_calc(case_18.__file__, 'job.ini', exports='csv')
-        fnames = out['gmfs', 'csv']
+        out = self.run_calc(case_18.__file__, 'job.ini', exports='txt')
+        fnames = out['gmf_data', 'txt']
         for exp, got in zip(expected, fnames):
             self.assertEqualFiles('expected/%s' % exp, got, sorted)

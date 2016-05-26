@@ -1,37 +1,41 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-#  Copyright (c) 2014-2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
-
-import os
 import re
+import pickle
 import logging
 import operator
 import collections
 
 import numpy
 
-from openquake.baselib.general import AccumDict, groupby, humansize
+from openquake.baselib.general import (
+    groupby, humansize, get_array, group_array)
 from openquake.hazardlib.imt import from_string
-from openquake.hazardlib.site import FilteredSiteCollection
+from openquake.hazardlib.calc import disagg
 from openquake.commonlib.export import export
-from openquake.commonlib.oqvalidation import OqParam
 from openquake.commonlib.writers import (
     scientificformat, floatformat, write_csv)
-from openquake.commonlib import hazard_writers
+from openquake.commonlib import writers, hazard_writers, util, readinput
+from openquake.risklib.riskinput import create
+from openquake.calculators import calc, base, event_based
+
+F32 = numpy.float32
 
 GMF_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
 GMF_WARNING = '''\
@@ -48,22 +52,20 @@ class SES(object):
     # exported XML file and the schema constraints the number to be
     # nonzero
     def __init__(self, ruptures, investigation_time, ordinal=1):
-        self.ruptures = sorted(ruptures, key=operator.attrgetter('tag'))
+        self.ruptures = sorted(ruptures, key=operator.attrgetter('etag'))
         self.investigation_time = investigation_time
         self.ordinal = ordinal
 
     def __iter__(self):
-        for sesrup in self.ruptures:
-            yield sesrup.export()
+        return iter(self.ruptures)
 
 
 class SESCollection(object):
     """
     Stochastic Event Set Collection
     """
-    def __init__(self, idx_ses_dict, sm_lt_path, investigation_time=None):
+    def __init__(self, idx_ses_dict, investigation_time=None):
         self.idx_ses_dict = idx_ses_dict
-        self.sm_lt_path = sm_lt_path
         self.investigation_time = investigation_time
 
     def __iter__(self):
@@ -78,39 +80,30 @@ def export_ses_xml(ekey, dstore):
     :param dstore: datastore object
     """
     fmt = ekey[-1]
-    oq = OqParam.from_(dstore.attrs)
-    try:
-        csm_info = dstore['rlzs_assoc'].csm_info
-    except AttributeError:  # for scenario calculators don't export
-        return []
-    sescollection = dstore['sescollection']
-    col_id = 0
-    fnames = []
-    for sm in csm_info.source_models:
-        for trt_model in sm.trt_models:
-            sesruptures = list(sescollection[col_id].values())
-            col_id += 1
-            ses_coll = SESCollection(
-                groupby(sesruptures, operator.attrgetter('ses_idx')),
-                sm.path, oq.investigation_time)
-            smpath = '_'.join(sm.path)
-            fname = 'ses-%d-smltp_%s.%s' % (trt_model.id, smpath, fmt)
-            dest = os.path.join(dstore.export_dir, fname)
-            globals()['_export_ses_' + fmt](dest, ses_coll)
-            fnames.append(os.path.join(dstore.export_dir, fname))
-    return fnames
+    oq = dstore['oqparam']
+    mesh = dstore['sitemesh'].value
+    ruptures = []
+    for serial in dstore['sescollection']:
+        sr = dstore['sescollection/' + serial]
+        ruptures.extend(sr.export(mesh))
+    ses_coll = SESCollection(
+        groupby(ruptures, operator.attrgetter('ses_idx')),
+        oq.investigation_time)
+    dest = dstore.export_path('ses.' + fmt)
+    globals()['_export_ses_' + fmt](dest, ses_coll)
+    return [dest]
 
 
 def _export_ses_xml(dest, ses_coll):
-    writer = hazard_writers.SESXMLWriter(dest, '_'.join(ses_coll.sm_lt_path))
+    writer = hazard_writers.SESXMLWriter(dest)
     writer.serialize(ses_coll)
 
 
 def _export_ses_csv(dest, ses_coll):
     rows = []
     for ses in ses_coll:
-        for sesrup in ses:
-            rows.append([sesrup.tag, sesrup.seed])
+        for rup in ses:
+            rows.append([rup.etag])
     write_csv(dest, sorted(rows, key=operator.itemgetter(0)))
 
 
@@ -138,14 +131,6 @@ class GmfSet(object):
                 self.investigation_time,
                 self.stochastic_event_set_id, '\n'.join(
                     sorted(str(g) for g in self.gmfset))))
-
-
-def get_ses_idx(tag):
-    """
-    >>> get_ses_idx("col=00~ses=0007~src=1-3~rup=018-01")
-    7
-    """
-    return int(tag.split('~')[1][4:])
 
 
 class GroundMotionField(object):
@@ -202,96 +187,34 @@ class GmfCollection(object):
     Object converting the parameters
 
     :param sitecol: SiteCollection
-    :rupture_tags: tags of the ruptures
-    :gmfs_by_imt: dictionary of GMFs by IMT
+    :param ruptures: ruptures
+    :param investigation_time: investigation time
 
     into an object with the right form for the EventBasedGMFXMLWriter.
     Iterating over a GmfCollection yields GmfSet objects.
     """
-    def __init__(self, sitecol, ruptures, gmfs, investigation_time):
+    def __init__(self, sitecol, imts, ruptures, investigation_time):
         self.sitecol = sitecol
         self.ruptures = ruptures
-        self.imts = sorted(gmfs[0].dtype.fields)
-        self.gmfs_by_imt = {imt: [gmf[imt] for gmf in gmfs]
-                            for imt in self.imts}
+        self.imts = imts
         self.investigation_time = investigation_time
 
     def __iter__(self):
+        completemesh = self.sitecol.complete.mesh
         gmfset = collections.defaultdict(list)
-        for imt_str in self.imts:
-            gmfs = self.gmfs_by_imt[imt_str]
+        for imti, imt_str in enumerate(self.imts):
             imt, sa_period, sa_damping = from_string(imt_str)
-            for rupture, gmf in zip(self.ruptures, gmfs):
-                if hasattr(rupture, 'indices'):  # event based
-                    indices = (list(range(len(self.sitecol)))
-                               if rupture.indices is None
-                               else rupture.indices)
-                    sites = FilteredSiteCollection(
-                        indices, self.sitecol)
-                    ses_idx = get_ses_idx(rupture.tag)
-                else:  # scenario
-                    sites = self.sitecol
-                    ses_idx = 1
-                nodes = (GroundMotionFieldNode(gmv, site.location)
-                         for site, gmv in zip(sites, gmf))
-                gmfset[ses_idx].append(
+            for rupture in self.ruptures:
+                mesh = completemesh[rupture.indices]
+                gmf = get_array(rupture.gmfa, imti=imti)['gmv']
+                assert len(mesh) == len(gmf), (len(mesh), len(gmf))
+                nodes = (GroundMotionFieldNode(gmv, loc)
+                         for gmv, loc in zip(gmf, mesh))
+                gmfset[rupture.ses_idx].append(
                     GroundMotionField(
-                        imt, sa_period, sa_damping, rupture.tag, nodes))
+                        imt, sa_period, sa_damping, rupture.etag, nodes))
         for ses_idx in sorted(gmfset):
             yield GmfSet(gmfset[ses_idx], self.investigation_time, ses_idx)
-
-
-def export_gmf_xml(key, dest, sitecol, ruptures, gmfs, rlz,
-                   investigation_time):
-    """
-    :param key: output_type and export_type
-    :param dest: name of the exported file
-    :param sitecol: the full site collection
-    :param ruptures: an ordered list of ruptures
-    :param gmfs: a matrix of ground motion fields of shape (R, N)
-    :param rlz: a realization object
-    :param investigation_time: investigation time (None for scenario)
-    """
-    if hasattr(rlz, 'gsim_rlz'):  # event based
-        smltpath = '_'.join(rlz.sm_lt_path)
-        gsimpath = rlz.gsim_rlz.uid
-    else:  # scenario
-        smltpath = ''
-        gsimpath = rlz.uid
-    writer = hazard_writers.EventBasedGMFXMLWriter(
-        dest, sm_lt_path=smltpath, gsim_lt_path=gsimpath)
-    writer.serialize(
-        GmfCollection(sitecol, ruptures, gmfs, investigation_time))
-    return {key: [dest]}
-
-
-def export_gmf_csv(key, dest, sitecol, ruptures, gmfs, rlz,
-                   investigation_time):
-    """
-    :param key: output_type and export_type
-    :param dest: name of the exported file
-    :param sitecol: the full site collection
-    :param ruptures: an ordered list of ruptures
-    :param gmfs: an orderd list of ground motion fields
-    :param rlz: a realization object
-    :param investigation_time: investigation time (None for scenario)
-    """
-    imts = list(gmfs[0].dtype.fields)
-    # the csv file has the form
-    # tag,indices,gmvs_imt_1,...,gmvs_imt_N
-    rows = []
-    for rupture, gmf in zip(ruptures, gmfs):
-        try:
-            indices = rupture.indices
-        except AttributeError:
-            indices = sitecol.indices
-        if indices is None:
-            indices = list(range(len(sitecol)))
-        row = [rupture.tag, ' '.join(map(str, indices))] + \
-              [gmf[imt] for imt in imts]
-        rows.append(row)
-    write_csv(dest, rows)
-    return {key: [dest]}
 
 # ####################### export hazard curves ############################ #
 
@@ -315,7 +238,7 @@ def export_hazard_curves_csv(key, dest, sitecol, curves_by_imt,
     # the + 1 is needed since the 0-th column contains lon lat
     rows = numpy.empty((nsites, len(imtls) + 1), dtype=object)
     for sid, lon, lat in zip(range(nsites), sitecol.lons, sitecol.lats):
-        rows[sid, 0] = '%s %s' % (lon, lat)
+        rows[sid, 0] = '%.5f %.5f' % (lon, lat)
     for i, imt in enumerate(curves_by_imt.dtype.names, 1):
         for sid, curve in zip(range(nsites), curves_by_imt[imt]):
             rows[sid, i] = scientificformat(curve, fmt='%11.7E')
@@ -379,20 +302,76 @@ def export_hcurves_csv(ekey, dstore):
     :param ekey: export key, i.e. a pair (datastore key, fmt)
     :param dstore: datastore object
     """
-    oq = OqParam.from_(dstore.attrs)
-    rlzs_assoc = dstore['rlzs_assoc']
+    oq = dstore['oqparam']
+    rlzs_assoc = dstore['csm_info'].get_rlzs_assoc()
     sitecol = dstore['sitecol']
+    sitemesh = dstore['sitemesh']
     key, fmt = ekey
     fnames = []
-    for kind, hcurves in dstore[key].items():
+    items = dstore['hmaps' if key == 'uhs' else key].items()
+    for kind, hcurves in sorted(items):
         fname = hazard_curve_name(
-            dstore, ekey, kind, rlzs_assoc,
-            oq.number_of_logic_tree_samples)
+            dstore, ekey, kind, rlzs_assoc, oq.number_of_logic_tree_samples)
         if key == 'uhs':
-            export_uhs_csv(ekey, fname, sitecol, hcurves)
+            uhs_curves = calc.make_uhs(hcurves, oq.imtls, oq.poes)
+            write_csv(fname, util.compose_arrays(sitemesh, uhs_curves))
+        elif key == 'hmaps':
+            write_csv(fname, util.compose_arrays(sitemesh, hcurves))
         else:
             export_hazard_curves_csv(ekey, fname, sitecol, hcurves, oq.imtls)
         fnames.append(fname)
+    return sorted(fnames)
+
+UHS = collections.namedtuple('UHS', 'imls location')
+
+
+def get_metadata(realizations, kind):
+    """
+    :param list realizations:
+        realization objects
+    :param str kind:
+        kind of data, i.e. a key in the datastore
+    :returns:
+        a dictionary with smlt_path, gsimlt_path, statistics, quantile_value
+    """
+    metadata = {}
+    if kind.startswith('rlz-'):
+        rlz = realizations[int(kind[4:])]
+        metadata['smlt_path'] = '_'.join(rlz.sm_lt_path)
+        metadata['gsimlt_path'] = rlz.gsim_rlz.uid
+    elif kind.startswith('quantile-'):
+        metadata['statistics'] = 'quantile'
+        metadata['quantile_value'] = float(kind[9:])
+    elif kind == 'mean':
+        metadata['statistics'] = 'mean'
+    return metadata
+
+
+@export.add(('uhs', 'xml'))
+def export_uhs_xml(ekey, dstore):
+    oq = dstore['oqparam']
+    rlzs_assoc = dstore['csm_info'].get_rlzs_assoc()
+    sitemesh = dstore['sitemesh'].value
+    key, fmt = ekey
+    fnames = []
+    periods = [imt for imt in oq.imtls if imt.startswith('SA') or imt == 'PGA']
+    for kind, hmaps in dstore['hmaps'].items():
+        metadata = get_metadata(rlzs_assoc.realizations, kind)
+        _, periods = calc.get_imts_periods(oq.imtls)
+        uhs = calc.make_uhs(hmaps, oq.imtls, oq.poes)
+        for poe in oq.poes:
+            poe_str = 'poe~%s' % poe
+            fname = hazard_curve_name(
+                dstore, ekey, kind + '-%s' % poe, rlzs_assoc,
+                oq.number_of_logic_tree_samples)
+            writer = hazard_writers.UHSXMLWriter(
+                fname, periods=periods, poe=poe,
+                investigation_time=oq.investigation_time, **metadata)
+            data = []
+            for site, curve in zip(sitemesh, uhs[poe_str]):
+                data.append(UHS(curve, Location(site)))
+            writer.serialize(data)
+            fnames.append(fname)
     return sorted(fnames)
 
 
@@ -410,26 +389,36 @@ HazardMap = collections.namedtuple('HazardMap', 'lon lat iml')
 def export_hcurves_xml_json(ekey, dstore):
     export_type = ekey[1]
     len_ext = len(export_type) + 1
-    oq = OqParam.from_(dstore.attrs)
+    oq = dstore['oqparam']
     sitemesh = dstore['sitemesh'].value
-    rlzs_assoc = dstore['rlzs_assoc']
+    rlzs_assoc = dstore['csm_info'].get_rlzs_assoc()
+    hcurves = dstore[ekey[0]]
     fnames = []
     writercls = (hazard_writers.HazardCurveGeoJSONWriter
                  if export_type == 'geojson' else
                  hazard_writers.HazardCurveXMLWriter)
-    rlzs = iter(rlzs_assoc.realizations)
-    for kind, curves in dstore[ekey[0]].items():
-        rlz = next(rlzs)
+    for kind in hcurves:
+        if kind.startswith('rlz-'):
+            rlz = rlzs_assoc.realizations[int(kind[4:])]
+            smlt_path = '_'.join(rlz.sm_lt_path)
+            gsimlt_path = rlz.gsim_rlz.uid
+        else:
+            smlt_path = ''
+            gsimlt_path = ''
+        curves = hcurves[kind]
         name = hazard_curve_name(
-            dstore, ekey, kind, rlzs_assoc, oq.number_of_logic_tree_samples)
+            dstore, ekey, kind, rlzs_assoc,
+            oq.number_of_logic_tree_samples)
         for imt in oq.imtls:
+            imtype, sa_period, sa_damping = from_string(imt)
             fname = name[:-len_ext] + '-' + imt + '.' + export_type
             data = [HazardCurve(Location(site), poes[imt])
                     for site, poes in zip(sitemesh, curves)]
-            writer = writercls(fname, investigation_time=oq.investigation_time,
-                               imls=oq.imtls[imt],
-                               smlt_path='_'.join(rlz.sm_lt_path),
-                               gsimlt_path=rlz.gsim_rlz.uid)
+            writer = writercls(fname,
+                               investigation_time=oq.investigation_time,
+                               imls=oq.imtls[imt], imt=imtype,
+                               sa_period=sa_period, sa_damping=sa_damping,
+                               smlt_path=smlt_path, gsimlt_path=gsimlt_path)
             writer.serialize(data)
             fnames.append(fname)
     return sorted(fnames)
@@ -438,68 +427,213 @@ def export_hcurves_xml_json(ekey, dstore):
 @export.add(('hmaps', 'xml'), ('hmaps', 'geojson'))
 def export_hmaps_xml_json(ekey, dstore):
     export_type = ekey[1]
-    oq = OqParam.from_(dstore.attrs)
+    oq = dstore['oqparam']
     sitemesh = dstore['sitemesh'].value
-    rlzs_assoc = dstore['rlzs_assoc']
+    rlzs_assoc = dstore['csm_info'].get_rlzs_assoc()
+    hmaps = dstore[ekey[0]]
     fnames = []
     writercls = (hazard_writers.HazardMapGeoJSONWriter
                  if export_type == 'geojson' else
                  hazard_writers.HazardMapXMLWriter)
-    rlzs = iter(rlzs_assoc.realizations)
-    for kind, maps in dstore[ekey[0]].items():
-        rlz = next(rlzs)
+    for kind in hmaps:
+        if kind.startswith('rlz-'):
+            rlz = rlzs_assoc.realizations[int(kind[4:])]
+            smlt_path = '_'.join(rlz.sm_lt_path)
+            gsimlt_path = rlz.gsim_rlz.uid
+        else:
+            smlt_path = ''
+            gsimlt_path = ''
+        maps = hmaps[kind]
         for imt in oq.imtls:
-            for i, poe in enumerate(oq.poes):
+            for poe in oq.poes:
                 suffix = '-%s-%s' % (poe, imt)
                 fname = hazard_curve_name(
                     dstore, ekey, kind + suffix, rlzs_assoc,
                     oq.number_of_logic_tree_samples)
-                data = [HazardMap(site[0], site[1], poes[imt][i])
-                        for site, poes in zip(sitemesh, maps)]
+                data = [HazardMap(site[0], site[1], hmap['%s~%s' % (imt, poe)])
+                        for site, hmap in zip(sitemesh, maps)]
                 writer = writercls(
                     fname, investigation_time=oq.investigation_time,
                     imt=imt, poe=poe,
-                    smlt_path='_'.join(rlz.sm_lt_path),
-                    gsimlt_path=rlz.gsim_rlz.uid)
+                    smlt_path=smlt_path, gsimlt_path=gsimlt_path)
                 writer.serialize(data)
                 fnames.append(fname)
     return sorted(fnames)
 
 
-@export.add(('gmfs', 'xml'), ('gmfs', 'csv'))
+@export.add(('gmf_data', 'xml'), ('gmf_data', 'txt'))
 def export_gmf(ekey, dstore):
     """
     :param ekey: export key, i.e. a pair (datastore key, fmt)
     :param dstore: datastore object
     """
     sitecol = dstore['sitecol']
-    rlzs_assoc = dstore['rlzs_assoc']
-    rupture_by_tag = sum(dstore['sescollection'], AccumDict())
-    all_tags = dstore['tags'].value
-    oq = OqParam.from_(dstore.attrs)
+    rlzs_assoc = dstore['csm_info'].get_rlzs_assoc()
+    oq = dstore['oqparam']
     investigation_time = (None if oq.calculation_mode == 'scenario'
                           else oq.investigation_time)
     samples = oq.number_of_logic_tree_samples
     fmt = ekey[-1]
-    gmfs = dstore[ekey[0]]
-    nbytes = gmfs.attrs['nbytes']
+    etags = dstore['etags'].value
+    gmf_data = dstore['gmf_data']
+    nbytes = gmf_data.attrs['nbytes']
     logging.info('Internal size of the GMFs: %s', humansize(nbytes))
     if nbytes > GMF_MAX_SIZE:
         logging.warn(GMF_WARNING, dstore.hdf5path)
     fnames = []
-    for rlz, gmf_by_idx in zip(
-            rlzs_assoc.realizations, rlzs_assoc.combine_gmfs(gmfs)):
-        tags = all_tags[list(gmf_by_idx)]
-        gmfs = list(gmf_by_idx.values())
-        if not gmfs:
-            continue
-        ruptures = [rupture_by_tag[tag] for tag in tags]
+    for rlz in rlzs_assoc.realizations:
+        gmf_arr = gmf_data['%04d' % rlz.ordinal].value
+        ruptures = []
+        for eid, gmfa in group_array(gmf_arr, 'eid').items():
+            rup = util.Rupture(etags[eid], sorted(set(gmfa['sid'])))
+            rup.gmfa = gmfa
+            ruptures.append(rup)
+        ruptures.sort(key=operator.attrgetter('etag'))
         fname = build_name(dstore, rlz, 'gmf', fmt, samples)
         fnames.append(fname)
         globals()['export_gmf_%s' % fmt](
-            ('gmf', fmt), fname, sitecol,
-            ruptures, gmfs, rlz, investigation_time)
+            ('gmf', fmt), fname, sitecol, oq.imtls, ruptures, rlz,
+            investigation_time)
     return fnames
+
+
+@export.add(('gmfs:', 'csv'))
+def export_gmf_spec(ekey, dstore, spec):
+    """
+    :param ekey: export key, i.e. a pair (datastore key, fmt)
+    :param dstore: datastore object
+    :param spec: a string specifying what to export exactly
+    """
+    oq = dstore['oqparam']
+    eids = numpy.array([int(rid) for rid in spec.split(',')])
+    sitemesh = dstore['sitemesh']
+    writer = writers.CsvWriter(fmt='%.5f')
+    etags = dstore['etags']
+    if 'scenario' in oq.calculation_mode:
+        _, gmfs_by_trt_gsim = base.get_gmfs(dstore)
+        gsims = sorted(gsim for trt, gsim in gmfs_by_trt_gsim)
+        imts = gmfs_by_trt_gsim[0, gsims[0]].dtype.names
+        gmf_dt = numpy.dtype([(str(gsim), F32) for gsim in gsims])
+        for eid in eids:
+            etag = etags[eid]
+            for imt in imts:
+                gmfa = numpy.zeros(len(sitemesh), gmf_dt)
+                for gsim in gsims:
+                    gmfa[str(gsim)] = gmfs_by_trt_gsim[0, gsim][imt][:, eid]
+                dest = dstore.export_path('gmf-%s-%s.csv' % (etag, imt))
+                data = util.compose_arrays(sitemesh, gmfa)
+                writer.save(data, dest)
+    else:  # event based
+        for eid in eids:
+            etag = etags[eid]
+            for gmfa, imt in _get_gmfs(dstore, util.get_serial(etag), eid):
+                dest = dstore.export_path('gmf-%s-%s.csv' % (etag, imt))
+                data = util.compose_arrays(sitemesh, gmfa)
+                writer.save(data, dest)
+    return writer.getsaved()
+
+
+def export_gmf_xml(key, dest, sitecol, imts, ruptures, rlz,
+                   investigation_time):
+    """
+    :param key: output_type and export_type
+    :param dest: name of the exported file
+    :param sitecol: the full site collection
+    :param imts: the list of intensity measure types
+    :param ruptures: an ordered list of ruptures
+    :param rlz: a realization object
+    :param investigation_time: investigation time (None for scenario)
+    """
+    if hasattr(rlz, 'gsim_rlz'):  # event based
+        smltpath = '_'.join(rlz.sm_lt_path)
+        gsimpath = rlz.gsim_rlz.uid
+    else:  # scenario
+        smltpath = ''
+        gsimpath = rlz.uid
+    writer = hazard_writers.EventBasedGMFXMLWriter(
+        dest, sm_lt_path=smltpath, gsim_lt_path=gsimpath)
+    writer.serialize(
+        GmfCollection(sitecol, imts, ruptures, investigation_time))
+    return {key: [dest]}
+
+
+def export_gmf_txt(key, dest, sitecol, imts, ruptures, rlz,
+                   investigation_time):
+    """
+    :param key: output_type and export_type
+    :param dest: name of the exported file
+    :param sitecol: the full site collection
+    :param imts: the list of intensity measure types
+    :param ruptures: an ordered list of ruptures
+    :param rlz: a realization object
+    :param investigation_time: investigation time (None for scenario)
+    """
+    # the csv file has the form
+    # etag,indices,gmvs_imt_1,...,gmvs_imt_N
+    rows = []
+    for rupture in ruptures:
+        indices = rupture.indices
+        gmvs = [a['gmv'] for a in group_array(rupture.gmfa, 'imti').values()]
+        row = [rupture.etag, ' '.join(map(str, indices))] + gmvs
+        rows.append(row)
+    write_csv(dest, rows)
+    return {key: [dest]}
+
+
+def get_rup_idx(ebrup, etag):
+    # extract the rupture and the index of the given etag from a collection
+    for etag_idx, tag in enumerate(ebrup.etags):
+        if tag == etag:
+            return etag_idx
+    raise ValueError('event tag %s not found in the rupture collection')
+
+
+def _get_gmfs(dstore, serial, eid):
+    oq = dstore['oqparam']
+    min_iml = event_based.fix_minimum_intensity(oq.minimum_intensity, oq.imtls)
+    rlzs_assoc = dstore['csm_info'].get_rlzs_assoc()
+    sitecol = dstore['sitecol'].complete
+    N = len(sitecol.complete)
+    rup = dstore['sescollection/' + serial]
+    correl_model = readinput.get_correl_model(oq)
+    gsims = rlzs_assoc.gsims_by_trt_id[rup.trt_id]
+    rlzs = [rlz for gsim in map(str, gsims)
+            for rlz in rlzs_assoc[rup.trt_id, gsim]]
+    gmf_dt = numpy.dtype([('%03d' % rlz.ordinal, F32) for rlz in rlzs])
+    gmfadict = create(event_based.GmfColl,
+                      [rup], sitecol, oq.imtls, rlzs_assoc,
+                      oq.truncation_level, correl_model, min_iml).by_rlzi()
+    for imti, imt in enumerate(oq.imtls):
+        gmfa = numpy.zeros(N, gmf_dt)
+        for rlzname in gmf_dt.names:
+            rlzi = int(rlzname)
+            gmvs = get_array(gmfadict[rlzi], eid=eid, imti=imti)['gmv']
+            gmfa[rlzname][rup.indices] = gmvs
+        yield gmfa, imt
+
+
+@export.add(('gmf_data', 'csv'))
+def export_gmf_scenario(ekey, dstore):
+    oq = dstore['oqparam']
+    if 'scenario' in oq.calculation_mode:
+        fields = ['%03d' % i for i in range(len(dstore['etags']))]
+        dt = numpy.dtype([(f, F32) for f in fields])
+        etags, gmfs_by_trt_gsim = base.get_gmfs(dstore)
+        sitemesh = dstore['sitemesh']
+        writer = writers.CsvWriter(fmt='%.5f')
+        for (trt, gsim), gmfs_ in gmfs_by_trt_gsim.items():
+            for imt in gmfs_.dtype.names:
+                gmfs = numpy.zeros(len(gmfs_), dt)
+                for i in range(len(gmfs)):
+                    gmfs[i] = tuple(gmfs_[imt][i])
+                dest = dstore.export_path('gmf-%s-%s.csv' % (gsim, imt))
+                data = util.compose_arrays(sitemesh, gmfs)
+                writer.save(data, dest)
+    else:  # event based
+        logging.warn('Not exporting the full GMFs for event_based, but you can'
+                     ' specify the rupture ordinals with gmfs:R1,...,Rn')
+        return []
+    return writer.getsaved()
 
 
 # not used right now
@@ -539,18 +673,41 @@ def export_hazard_curves_xml(key, dest, sitecol, curves_by_imt,
     return {dest: dest}
 
 
-def export_uhs_csv(key, dest, sitecol, hmaps):
-    """
-    Export the scalar outputs.
+DisaggMatrix = collections.namedtuple(
+    'DisaggMatrix', 'poe iml dim_labels matrix')
 
-    :param key: output_type and export_type
-    :param dest: file name
-    :param sitecol: site collection
-    :param hmaps:
-        an array N x I x P where N is the number of sites,
-        I the number of IMTs of SA type, and P the number of poes
-    """
-    rows = [[[lon, lat]] + list(row)
-            for lon, lat, row in zip(sitecol.lons, sitecol.lats, hmaps)]
-    write_csv(dest, rows)
-    return {dest: dest}
+
+@export.add(('disagg', 'xml'))
+def export_disagg_xml(ekey, dstore):
+    oq = dstore['oqparam']
+    rlzs = dstore['csm_info'].get_rlzs_assoc().realizations
+    group = dstore['disagg']
+    fnames = []
+    writercls = hazard_writers.DisaggXMLWriter
+    for key in group:
+        matrix = pickle.loads(group[key].value)
+        attrs = group[key].attrs
+        rlz = rlzs[attrs['rlzi']]
+        poe = attrs['poe']
+        iml = attrs['iml']
+        imt, sa_period, sa_damping = from_string(attrs['imt'])
+        fname = dstore.export_path(key + '.xml')
+        lon, lat = attrs['location']
+        # TODO: add poe=poe below
+        writer = writercls(
+            fname, investigation_time=oq.investigation_time,
+            imt=imt, smlt_path='_'.join(rlz.sm_lt_path),
+            gsimlt_path=rlz.gsim_rlz.uid, lon=lon, lat=lat,
+            sa_period=sa_period, sa_damping=sa_damping,
+            mag_bin_edges=attrs['mag_bin_edges'],
+            dist_bin_edges=attrs['dist_bin_edges'],
+            lon_bin_edges=attrs['lon_bin_edges'],
+            lat_bin_edges=attrs['lat_bin_edges'],
+            eps_bin_edges=attrs['eps_bin_edges'],
+            tectonic_region_types=attrs['trts'],
+        )
+        data = [DisaggMatrix(poe, iml, dim_labels, matrix[i])
+                for i, dim_labels in enumerate(disagg.pmf_map)]
+        writer.serialize(data)
+        fnames.append(fname)
+    return sorted(fnames)

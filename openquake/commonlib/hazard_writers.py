@@ -1,20 +1,21 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 """
 Classes for serializing various NRML XML artifacts.
 """
@@ -29,7 +30,7 @@ import numpy
 from xml.etree import ElementTree as et
 
 from openquake.commonlib import node, nrml
-from openquake.commonlib.writers import scientificformat
+from openquake.commonlib.writers import scientificformat, floatformat
 
 by_imt = operator.itemgetter('imt', 'sa_period', 'sa_damping')
 
@@ -72,9 +73,9 @@ def _validate_hazard_metadata(md):
     :raises:
         :exc:`ValueError` if the metadata is not valid.
     """
-    if (md.get('statistics') is not None
-        and (md.get('smlt_path') is not None
-             or md.get('gsimlt_path') is not None)):
+    if (md.get('statistics') is not None and (
+            md.get('smlt_path') is not None or
+            md.get('gsimlt_path') is not None)):
         raise ValueError('Cannot specify both `statistics` and logic tree '
                          'paths')
 
@@ -320,9 +321,9 @@ def gen_gmfs(gmf_set):
         if gmf.imt == 'SA':
             gmf_node['saPeriod'] = str(gmf.sa_period)
             gmf_node['saDamping'] = str(gmf.sa_damping)
-        tag = gmf.rupture_id
-        if tag:
-            gmf_node['ruptureId'] = tag
+        etag = gmf.rupture_id
+        if etag:
+            gmf_node['ruptureId'] = etag
         sorted_nodes = sorted(gmf)
         gmf_node.nodes = (
             node.Node(
@@ -402,7 +403,7 @@ def rupture_to_element(rupture, parent=None):
     Convert a rupture object into an Element object.
 
     :param rupture:
-        must have attributes .rupture, .tag and .seed
+        must have attributes .rupture, .etag and .seed
     :param parent:
         if None a new element is created, otherwise a sub element is
         attached to the parent.
@@ -412,10 +413,8 @@ def rupture_to_element(rupture, parent=None):
     else:
         rup_elem = et.SubElement(parent, 'rupture')
 
-    rup_elem.append(et.Comment('rupture seed=%d' % rupture.seed))
-
     rup = rupture.rupture
-    rup_elem.set('id', rupture.tag)
+    rup_elem.set('id', rupture.etag)
     rup_elem.set('magnitude', str(rup.magnitude))
     rup_elem.set('strike', str(rup.strike))
     rup_elem.set('dip', str(rup.dip))
@@ -518,11 +517,8 @@ class SESXMLWriter(object):
         GSIM logic tree branch identifier of the logic tree realization which
         produced this collection of stochastic event sets.
     """
-    # gsim_lt_path is there only for backward compatibility, it is scheduled
-    # for complete removal (MS)
-    def __init__(self, dest, sm_lt_path, gsim_lt_path=None):
+    def __init__(self, dest):
         self.dest = dest
-        self.sm_lt_path = sm_lt_path
 
     def serialize(self, data):
         """
@@ -537,7 +533,7 @@ class SESXMLWriter(object):
             * be iterable, yielding a sequence of "rupture" objects
 
             Each rupture" should have the following attributes:
-            * `tag`
+            * `etag`
             * `magnitude`
             * `strike`
             * `dip`
@@ -584,7 +580,6 @@ class SESXMLWriter(object):
             root = et.Element('nrml')
             ses_container = et.SubElement(
                 root, 'stochasticEventSetCollection')
-            ses_container.set(SM_TREE_PATH, self.sm_lt_path)
             for ses in data:
                 ruptures = list(ses)
                 if not ruptures:  # empty SES, don't export it
@@ -595,7 +590,6 @@ class SESXMLWriter(object):
                 ses_elem.set('investigationTime', str(ses.investigation_time))
                 for rupture in ruptures:
                     rupture_to_element(rupture, ses_elem)
-
             nrml.write(list(root), fh)
 
 
@@ -793,7 +787,7 @@ class DisaggXMLWriter(object):
               curve at the given ``poe``.
         """
 
-        with nrml.NRMLFile(self.dest, 'w') as fh:
+        with nrml.NRMLFile(self.dest, 'w') as fh, floatformat('%.6E'):
             root = et.Element('nrml')
 
             diss_matrices = et.SubElement(root, 'disaggMatrices')

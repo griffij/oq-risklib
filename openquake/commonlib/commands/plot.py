@@ -1,23 +1,23 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 from __future__ import print_function
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
-
-from openquake.commonlib import sap, datastore, oqvalidation
+from openquake.commonlib import sap, datastore
 from openquake.commonlib.commands.show import get_hcurves_and_means
 
 
@@ -55,15 +55,11 @@ def make_figure(indices, imtls, spec_curves, curves=(), label=''):
 def plot(calc_id, other_id=None, sites='0'):
     """
     Hazard curves plotter.
-
-    :param calc_id: calculation numeric ID
-    :param other_id: ID of another calculation (optional)
-    :param sites: comma-separated string with the site indices
     """
     # read the hazard data
-    haz = datastore.DataStore(calc_id)
-    other = datastore.DataStore(other_id) if other_id else None
-    oq = oqvalidation.OqParam.from_(haz.attrs)
+    haz = datastore.read(calc_id)
+    other = datastore.read(other_id) if other_id else None
+    oq = haz['oqparam']
     indices = list(map(int, sites.split(',')))
     n_sites = len(haz['sitemesh'])
     if not set(indices) <= set(range(n_sites)):
@@ -71,15 +67,15 @@ def plot(calc_id, other_id=None, sites='0'):
         print('The indices %s are invalid: no graph for them' % invalid)
     valid = sorted(set(range(n_sites)) & set(indices))
     print('Found %d site(s); plotting %d of them' % (n_sites, len(valid)))
-    curves_by_rlz, mean_curves = get_hcurves_and_means(haz)
     if other is None:
+        curves_by_rlz, mean_curves = get_hcurves_and_means(haz)
         single_curve = len(curves_by_rlz) == 1 or not getattr(
             oq, 'individual_curves', True)
         plt = make_figure(valid, oq.imtls, mean_curves,
                           {} if single_curve else curves_by_rlz, 'mean')
     else:
-        _, mean1 = get_hcurves_and_means(haz)
-        _, mean2 = get_hcurves_and_means(other)
+        mean1 = haz['hcurves/mean']
+        mean2 = other['hcurves/mean']
         plt = make_figure(valid, oq.imtls, mean1, {'mean': mean2}, 'reference')
     plt.show()
 

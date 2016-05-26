@@ -1,11 +1,29 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 from nose.plugins.attrib import attr
 
 from openquake.qa_tests_data.classical_risk import (
-    case_1, case_2, case_3, case_4)
+    case_1, case_2, case_3, case_4, case_5, case_master)
+from openquake.baselib.general import writetmp
 from openquake.calculators.tests import CalculatorTestCase
 from openquake.commonlib.writers import scientificformat
-
-import numpy.testing
+from openquake.commonlib.datastore import view
 
 
 class ClassicalRiskTestCase(CalculatorTestCase):
@@ -15,14 +33,9 @@ class ClassicalRiskTestCase(CalculatorTestCase):
         out = self.run_calc(case_1.__file__, 'job_risk.ini', exports='xml')
 
         # check loss ratios
-        lrs = self.calc.datastore['loss_ratios']
-        self.assertEqual(lrs.dtype.names, ('structural',))
-        numpy.testing.assert_equal(lrs.attrs['imt_taxos'], [['PGA', 'VF']])
-        got = scientificformat(lrs['structural'][0], '%.2f')
-        self.assertEqual(got, '0.00 0.01 0.02 0.03 0.04 0.05 0.06 0.07 0.08 '
-                         '0.09 0.10 0.12 0.14 0.16 0.18 0.20 0.24 0.28 0.32 '
-                         '0.36 0.40 0.48 0.56 0.64 0.72 0.80 0.84 0.88 0.92 '
-                         '0.96 1.00')
+        lrs = self.calc.datastore['composite_risk_model/VF/structural']
+        got = scientificformat(lrs.mean_loss_ratios, '%.2f')
+        self.assertEqual(got, '0.05 0.10 0.20 0.40 0.80')
 
         # check loss curves
         [fname] = out['loss_curves-rlzs', 'xml']
@@ -56,10 +69,38 @@ class ClassicalRiskTestCase(CalculatorTestCase):
     @attr('qa', 'risk', 'classical_risk')
     def test_case_4(self):
         out = self.run_calc(case_4.__file__, 'job_haz.ini,job_risk.ini',
-                            exports='csv')
+                            exports='csv,xml')
+        fnames = out['loss_maps-rlzs', 'csv']
+        self.assertEqualFiles('expected/loss_maps-b1,b1.csv', fnames[0])
+        self.assertEqualFiles('expected/loss_maps-b1,b2.csv', fnames[1])
+
         fnames = out['loss_curves-rlzs', 'csv']
         self.assertEqualFiles('expected/loss_curves-000.csv', fnames[0])
         self.assertEqualFiles('expected/loss_curves-001.csv', fnames[1])
 
-    # TODO: tests with more than a loss type
-    # tests with more than one pair IMT, taxo
+        [fname] = out['loss_maps-stats', 'xml']
+        self.assertEqualFiles('expected/loss_maps-mean-structural.xml', fname)
+
+        [fname] = out['loss_curves-stats', 'xml']
+        self.assertEqualFiles('expected/loss_curves-mean-structural.xml',
+                              fname)
+
+    # test with 1 hazard site and 2 risk sites using assoc_assets_sites
+    @attr('qa', 'risk', 'classical_risk')
+    def test_case_5(self):
+        # test with different curve resolution for different taxonomies
+        out = self.run_calc(case_5.__file__, 'job_h.ini,job_r.ini',
+                            exports='xml', individual_curves='false')
+
+        # check mean loss curves
+        [fname] = out['loss_curves-stats', 'xml']
+        self.assertEqualFiles('expected/loss_curves-mean.xml', fname)
+
+        # check individual avg losses
+        fname = writetmp(view('loss_curves_avg', self.calc.datastore))
+        self.assertEqualFiles('expected/loss_curves_avg.txt', fname)
+
+    @attr('qa', 'risk', 'classical_risk')
+    def test_case_master(self):
+        self.run_calc(case_master.__file__, 'job.ini')
+        # TODO: check the expected mean/quantiles curves

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# packager.sh  Copyright (c) 2014, GEM Foundation.
+# packager.sh  Copyright (C) 2014-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -62,14 +62,22 @@ if [ "$GEM_EPHEM_NAME" = "" ]; then
     GEM_EPHEM_NAME="ubuntu-lxc-eph"
 fi
 
-if command -v lxc-shutdown &> /dev/null; then
-    # Older lxc (< 1.0.0) with lxc-shutdown
-    LXC_TERM="lxc-shutdown -t 10 -w"
-    LXC_KILL="lxc-stop"
+LXC_VER=$(lxc-ls --version | cut -d '.' -f 1)
+
+if [ $LXC_VER -lt 1 ]; then
+    echo "lxc >= 1.0.0 is required." >&2
+    exit 1
+fi
+
+LXC_TERM="lxc-stop -t 10"
+LXC_KILL="lxc-stop -k"
+
+if command -v lxc-copy &> /dev/null; then
+    # New lxc (>= 2.0.0) with lxc-copy
+    GEM_EPHEM_EXE="${GEM_EPHEM_CMD} -n ${GEM_EPHEM_NAME} -e"
 else
-    # Newer lxc (>= 1.0.0) with lxc-stop only
-    LXC_TERM="lxc-stop -t 10"
-    LXC_KILL="lxc-stop -k"
+    # Old lxc (< 2.0.0) with lxc-start-ephimeral
+    GEM_EPHEM_EXE="${GEM_EPHEM_CMD} -o ${GEM_EPHEM_NAME} -d"
 fi
 
 NL="
@@ -178,8 +186,8 @@ usage () {
 
     echo
     echo "USAGE:"
-    echo "    $0 [<-s|--serie> <precise|trusty>] [-D|--development] [-S--sources_copy] [-B|--binaries] [-U|--unsigned] [-R|--repository]    build debian source package."
-    echo "       if -s is present try to produce sources for a specific ubuntu version (precise or trusty),"
+    echo "    $0 [<-s|--serie> <precise|trusty|xenial>] [-D|--development] [-S--sources_copy] [-B|--binaries] [-U|--unsigned] [-R|--repository]    build debian source package."
+    echo "       if -s is present try to produce sources for a specific ubuntu version (precise, trusty or xenial),"
     echo "           (default precise)"
     echo "       if -S is present try to copy sources to <GEM_DEB_MONOTONE>/<BUILD_UBUVER>/source directory"
     echo "       if -B is present binary package is build too."
@@ -220,6 +228,7 @@ _pkgbuild_innervm_run () {
     scp -r * $lxc_ip:build-deb
     gpg -a --export | ssh $lxc_ip "sudo apt-key add -"
     ssh $lxc_ip sudo apt-get update
+    ssh $lxc_ip sudo apt-get upgrade -y
     ssh $lxc_ip sudo apt-get -y install build-essential dpatch fakeroot devscripts equivs lintian quilt
     ssh $lxc_ip "sudo mk-build-deps --install --tool 'apt-get -y' build-deb/debian/control"
 
@@ -261,8 +270,8 @@ _devtest_innervm_run () {
 
     # add custom packages
     ssh $lxc_ip mkdir -p "repo"
-    scp -r ${GEM_DEB_REPO}/${BUILD_UBUVER}/custom_pkgs $lxc_ip:repo/custom_pkgs
-    ssh $lxc_ip "sudo apt-add-repository \"deb file:/home/ubuntu/repo/custom_pkgs ./\""
+    scp -r ${GEM_DEB_REPO}/custom_pkgs $lxc_ip:repo/custom_pkgs
+    ssh $lxc_ip "sudo apt-add-repository \"deb file:/home/ubuntu/repo/custom_pkgs ${BUILD_UBUVER} main\""
 
     ssh $lxc_ip "sudo apt-get update"
     ssh $lxc_ip "sudo apt-get upgrade -y"
@@ -271,7 +280,7 @@ _devtest_innervm_run () {
     IFS=" "
     for dep in $GEM_GIT_DEPS; do
         # extract dependencies for source dependencies
-        pkgs_list="$(deps_list "deprec" _jenkins_deps/$dep/debian/control)"
+        pkgs_list="$(deps_list "deprec" _jenkins_deps/$dep/debian)"
         ssh $lxc_ip "sudo apt-get install -y ${pkgs_list}"
 
         # install source dependencies
@@ -282,7 +291,7 @@ _devtest_innervm_run () {
     IFS="$old_ifs"
 
     # extract dependencies for this package
-    pkgs_list="$(deps_list "all" debian/control)"
+    pkgs_list="$(deps_list "all" debian)"
     ssh $lxc_ip "sudo apt-get install -y ${pkgs_list}"
 
     # build oq-hazardlib speedups and put in the right place
@@ -303,16 +312,75 @@ _devtest_innervm_run () {
             skip_tests="!slow,"
         fi
 
-        ssh $lxc_ip "export PYTHONPATH=\"\$PWD/oq-risklib:\$PWD/oq-hazardlib\" ;
-                 cd $GEM_GIT_PACKAGE ;
-                 nosetests -a '${skip_tests}' -v --with-doctest --with-coverage --cover-package=openquake.baselib --cover-package=openquake.risklib --cover-package=openquake.commonlib --with-xunit ;
-                 bin/slowtests nosetests.xml"
+        ssh $lxc_ip "export GEM_SET_DEBUG=$GEM_SET_DEBUG
+                 set -e
+                 if [ -n \"\$GEM_SET_DEBUG\" -a \"\$GEM_SET_DEBUG\" != \"false\" ]; then
+                     export PS4='+\${BASH_SOURCE}:\${LINENO}:\${FUNCNAME[0]}: '
+                     set -x
+                 fi
+                 export PYTHONPATH=\"\$PWD/oq-risklib:\$PWD/oq-hazardlib\"
+                 cd $GEM_GIT_PACKAGE
+                 nosetests -a '${skip_tests}' -v --with-doctest --with-coverage --cover-package=openquake.baselib --cover-package=openquake.risklib --cover-package=openquake.commonlib --with-xunit
+                 bin/slowtests nosetests.xml
+                 ./openquake/risklib/tests/bin/bash_tests.sh all bashtests.xml"
         scp "$lxc_ip:$GEM_GIT_PACKAGE/nosetests.xml" "out_${BUILD_UBUVER}/"
+        scp "$lxc_ip:$GEM_GIT_PACKAGE/bashtests.xml" "out_${BUILD_UBUVER}/"
     else
         if [ -d $HOME/fake-data/$GEM_GIT_PACKAGE ]; then
             cp $HOME/fake-data/$GEM_GIT_PACKAGE/* "out_${BUILD_UBUVER}/"
         fi
     fi
+    trap ERR
+
+    return
+}
+
+_builddoc_innervm_run () {
+    local i old_ifs pkgs_list dep lxc_ip="$1" branch="$2"
+
+    trap 'local LASTERR="$?" ; trap ERR ; (exit $LASTERR) ; return' ERR
+
+    ssh $lxc_ip "rm -f ssh.log"
+
+    ssh $lxc_ip "sudo apt-get update"
+    ssh $lxc_ip "sudo apt-get -y upgrade"
+    gpg -a --export | ssh $lxc_ip "sudo apt-key add -"
+    # install package to manage repository properly
+    # ssh $lxc_ip "sudo apt-get install -y python-software-properties"
+
+    old_ifs="$IFS"
+    IFS=" "
+    for dep in $GEM_GIT_DEPS; do
+        # extract dependencies for source dependencies
+        pkgs_list="$(deps_list "build" _jenkins_deps/$dep/debian)"
+        ssh $lxc_ip "sudo apt-get install -y ${pkgs_list}"
+
+        # install source dependencies
+        cd _jenkins_deps/$dep
+        git archive --prefix ${dep}/ HEAD | ssh $lxc_ip "tar xv"
+        cd -
+    done
+    IFS="$old_ifs"
+
+    # extract dependencies for this package
+    pkgs_list="$(deps_list "all" debian)"
+    ssh $lxc_ip "sudo apt-get install -y ${pkgs_list}"
+
+    # build oq-hazardlib speedups and put in the right place
+    ssh $lxc_ip "set -e
+                 cd oq-hazardlib
+                 python ./setup.py build
+                 for i in \$(find build/ -name *.so); do
+                     o=\"\$(echo \"\$i\" | sed 's@^[^/]\+/[^/]\+/@@g')\"
+                     cp \$i \$o
+                 done"
+
+    # TODO: version check
+    git archive --prefix ${GEM_GIT_PACKAGE}/ HEAD | ssh $lxc_ip "tar xv"
+
+    ssh $lxc_ip "export PYTHONPATH=\"\$PWD/oq-risklib:\$PWD/oq-hazardlib\" ;
+                 cd ${GEM_GIT_PACKAGE}/doc ; make html"
+    scp -r "$lxc_ip:$GEM_GIT_PACKAGE/doc/_build/html" "out_${BUILD_UBUVER}/"
     trap ERR
 
     return
@@ -407,8 +475,8 @@ _pkgtest_innervm_run () {
     IFS="$old_ifs"
 
     # add custom packages
-    scp -r ${GEM_DEB_REPO}/${BUILD_UBUVER}/custom_pkgs $lxc_ip:repo/custom_pkgs
-    ssh $lxc_ip "sudo apt-add-repository \"deb file:/home/ubuntu/repo/custom_pkgs ./\""
+    scp -r ${GEM_DEB_REPO}/custom_pkgs $lxc_ip:repo/custom_pkgs
+    ssh $lxc_ip "sudo apt-add-repository \"deb file:/home/ubuntu/repo/custom_pkgs ${BUILD_UBUVER} main\""
 
     ssh $lxc_ip "sudo apt-get update"
     ssh $lxc_ip "sudo apt-get upgrade -y"
@@ -429,20 +497,16 @@ _pkgtest_innervm_run () {
         oq-lite run ClassicalRisk/job_hazard.ini,ClassicalRisk/job_risk.ini
 
         echo 'running ScenarioDamage...'
-        oq-lite run ScenarioDamage/job.ini
-        oq-lite export -1 dmg_by_asset xml /tmp
+        oq-lite run ScenarioDamage/job_hazard.ini,ScenarioDamage/job_risk.ini
+        oq-lite export -e xml dmg_by_asset /tmp
 
         echo 'running ScenarioRisk...'
         oq-lite run ScenarioRisk/job.ini
-        oq-lite show -1 agglosses-rlzs > /tmp/agglosses.csv
-        oq-lite show -1 totlosses > /tmp/totlosses.txt
-        cmp /tmp/agglosses.csv ScenarioRisk/expected_agglosses.csv
-        cmp /tmp/totlosses.txt ScenarioRisk/expected_totlosses.txt
 
         echo 'running EventBasedRisk...'
         oq-lite run EventBasedRisk/job.ini
-        oq-lite export -1 loss_maps-rlzs xml /tmp
-        oq-lite show -1 performance
+        oq-lite export -e xml loss_maps-rlzs /tmp
+        oq-lite show performance
 
         echo 'running ClassicalRisk...'
         oq-lite run ClassicalRisk/job_hazard.ini,ClassicalRisk/job_risk.ini
@@ -451,12 +515,19 @@ _pkgtest_innervm_run () {
         oq-lite run ClassicalBCR/job_hazard.ini,ClassicalBCR/job_risk.ini
 
         cd ../hazard
+        echo 'running Disaggregation'
+        oq-lite run Disaggregation/job.ini
+
         echo 'running LogicTreeCase1ClassicalPSHA'
         oq-lite run LogicTreeCase1ClassicalPSHA/job.ini
-        oq-lite show -1 --rlzs
+
+        echo 'running LogicTreeCase3ClassicalPSHA'
+        oq-lite run LogicTreeCase3ClassicalPSHA/job.ini --exports xml
+        oq-lite show rlzs
 
         echo 'Show all the oq-lite calculations'
-        oq-lite show 0
+        oq-lite show all
+        oq-lite show all > /tmp/all.txt  # stress encoding issues
         "
     fi
 
@@ -469,23 +540,33 @@ _pkgtest_innervm_run () {
 }
 
 #
-#  deps_list <listtype> <filename> - retrieve dependencies list from debian/control
+#  deps_list <listtype> <filename> - retrieve dependencies list from debian/control and debian/rules
 #                                    to be able to install them without the package
 #      listtype    inform deps_list which control lines use to get dependencies
 #      filename    control file used for input
 #
 deps_list() {
-    local old_ifs out_list skip i d listtype="$1" filename="$2"
+    local old_ifs out_list skip i d listtype="$1" control_file="$2"/control rules_file="$2"/rules
+
+    if grep -q "^${BUILD_UBUVER^^}_DEP" $rules_file; then
+        # Use custom dependencies in debian/rules
+        rules_dep=$(grep "^${BUILD_UBUVER^^}_DEP *= *" $rules_file | sed 's/([^)]*)//g' | sed 's/^.*= *//g')
+        rules_rec=$(grep "^${BUILD_UBUVER^^}_REC *= *" $rules_file | sed 's/([^)]*)//g' | sed 's/^.*= *//g')
+    else
+        # Otherwise use the default values in debian/rules
+        rules_dep=$(grep "^DEFAULT_DEP *= *" $rules_file | sed 's/([^)]*)//g' | sed 's/^.*= *//g')
+        rules_rec=$(grep "^DEFAULT_REC *= *" $rules_file | sed 's/([^)]*)//g' | sed 's/^.*= *//g')
+    fi
 
     out_list=""
     if [ "$listtype" = "all" ]; then
-        in_list="$(cat "$filename" | egrep '^Depends:|^Recommends:|Build-Depends:' | sed 's/^\(Build-\)\?Depends://g;s/^Recommends://g' | tr '\n' ',')"
+        in_list="$((cat "$control_file" | egrep '^Depends:|^Recommends:|Build-Depends:' | sed 's/^\(Build-\)\?Depends://g;s/^Recommends://g' ; echo ", $rules_dep, $rules_rec") | tr '\n' ','| sed 's/,\+/,/g')"
     elif [  "$listtype" = "deprec" ]; then
-        in_list="$(cat "$filename" | egrep '^Depends:|^Recommends:' | sed 's/^Depends://g;s/^Recommends://g' | tr '\n' ',')"
+        in_list="$((cat "$control_file" | egrep '^Depends:|^Recommends:' | sed 's/^Depends://g;s/^Recommends://g' ; echo ", $rules_dep, $rules_rec") | tr '\n' ','| sed 's/,\+/,/g')"
     elif [  "$listtype" = "build" ]; then
-        in_list="$(cat "$filename" | egrep '^Depends:|^Build-Depends:' | sed 's/^\(Build-\)\?Depends://g' | tr '\n' ',')"
+        in_list="$((cat "$control_file" | egrep '^Depends:|^Build-Depends:' | sed 's/^\(Build-\)\?Depends://g' ; echo ", $rules_dep") | tr '\n' ','| sed 's/,\+/,/g')"
     else
-        in_list="$(cat "$filename" | egrep "^Depends:" | sed 's/^Depends: //g')"
+        in_list="$((cat "$control_file" | egrep "^Depends:" | sed 's/^Depends: //g'; echo ", $rules_dep") | tr '\n' ','| sed 's/,\+/,/g')"
     fi
 
     old_ifs="$IFS"
@@ -655,7 +736,7 @@ devtest_run () {
     IFS="$old_ifs"
 
     sudo echo
-    sudo ${GEM_EPHEM_CMD} -o $GEM_EPHEM_NAME -d 2>&1 | tee /tmp/packager.eph.$$.log &
+    sudo ${GEM_EPHEM_EXE} 2>&1 | tee /tmp/packager.eph.$$.log &
     _lxc_name_and_ip_get /tmp/packager.eph.$$.log
 
     _wait_ssh $lxc_ip
@@ -665,6 +746,100 @@ devtest_run () {
     inner_ret=$?
 
     scp "${lxc_ip}:ssh.log" "out_${BUILD_UBUVER}/devtest.history"
+
+    sudo $LXC_TERM -n $lxc_name
+    set -e
+
+    if [ -f /tmp/packager.eph.$$.log ]; then
+        rm /tmp/packager.eph.$$.log
+    fi
+
+    return $inner_ret
+}
+
+builddoc_run () {
+    local deps old_ifs branch="$1" branch_cur
+
+    if [ ! -d "out_${BUILD_UBUVER}" ]; then
+        mkdir "out_${BUILD_UBUVER}"
+    fi
+
+    if [ ! -d _jenkins_deps ]; then
+        mkdir _jenkins_deps
+    fi
+
+    #
+    #  dependencies repos
+    #
+    # in test sources different repositories and branches can be tested
+    # consistently: for each openquake dependency it try to use
+    # the same repository and the same branch OR the gem repository
+    # and the same branch OR the gem repository and the "master" branch
+    #
+    repo_id="$(repo_id_get)"
+    if [ "$repo_id" != "$GEM_GIT_REPO" ]; then
+        repos="git://${repo_id} ${GEM_GIT_REPO}"
+    else
+        repos="${GEM_GIT_REPO}"
+    fi
+    old_ifs="$IFS"
+    IFS=" "
+    for dep in $GEM_GIT_DEPS; do
+        found=0
+        branch_cur="$branch"
+        for repo in $repos; do
+            # search of same branch in same repo or in GEM_GIT_REPO repo
+            if git ls-remote --heads $repo/${dep}.git | grep -q "refs/heads/$branch_cur" ; then
+                deps_check_or_clone "$dep" "$repo/${dep}.git" "$branch_cur"
+                found=1
+                break
+            fi
+        done
+        # if not found it fallback in master branch of GEM_GIT_REPO repo
+        if [ $found -eq 0 ]; then
+            branch_cur="master"
+            deps_check_or_clone "$dep" "$repo/${dep}.git" "$branch_cur"
+        fi
+        cd _jenkins_deps/$dep
+        commit="$(git log -1 | grep '^commit' | sed 's/^commit //g')"
+        cd -
+        echo "dependency: $dep"
+        echo "repo:       $repo"
+        echo "branch:     $branch_cur"
+        echo "commit:     $commit"
+        echo
+        var_pfx="$(dep2var "$dep")"
+        if [ ! -f _jenkins_deps_info ]; then
+            touch _jenkins_deps_info
+        fi
+        if grep -q "^${var_pfx}_COMMIT=" _jenkins_deps_info; then
+            if ! grep -q "^${var_pfx}_COMMIT=$commit" _jenkins_deps_info; then
+                echo "ERROR: $repo -> $branch_cur changed during test:"
+                echo "before:"
+                grep "^${var_pfx}_COMMIT=" _jenkins_deps_info
+                echo "after:"
+                echo "${var_pfx}_COMMIT=$commit"
+                exit 1
+            fi
+        else
+            echo "${var_pfx}_COMMIT=$commit" >> _jenkins_deps_info
+            echo "${var_pfx}_REPO=$repo"     >> _jenkins_deps_info
+            echo "${var_pfx}_BRANCH=$branch_cur" >> _jenkins_deps_info
+        fi
+    done
+    IFS="$old_ifs"
+
+    sudo echo
+    sudo ${GEM_EPHEM_EXE} 2>&1 | tee /tmp/packager.eph.$$.log &
+    _lxc_name_and_ip_get /tmp/packager.eph.$$.log
+
+    _wait_ssh $lxc_ip
+
+    set +e
+    _builddoc_innervm_run "$lxc_ip" "$branch"
+    inner_ret=$?
+
+    scp "${lxc_ip}:ssh.log" "out_${BUILD_UBUVER}/builddoc.history"
 
     sudo $LXC_TERM -n $lxc_name
     set -e
@@ -709,25 +884,28 @@ pkgtest_run () {
     dpkg-scansources . > Sources
     cat Sources | gzip > Sources.gz
     cat > Release <<EOF
-Archive: $BUILD_UBUVER
-Origin: Ubuntu
-Label: Local Ubuntu ${BUILD_UBUVER^} Repository
-Architecture: amd64
-MD5Sum:
+Origin: openquake-${BUILD_UBUVER}
+Label: OpenQuake Local Ubuntu Repository
+Codename: $BUILD_UBUVER
+Date: $(date -R)
+Architectures: amd64
+Components: main
+Description: OpenQuake Local Ubuntu Repository
+SHA256:
 EOF
-    printf ' '$(md5sum Packages | cut --delimiter=' ' --fields=1)' %16d Packages\n' \
+    printf ' '$(sha256sum Packages | cut --delimiter=' ' --fields=1)' %16d Packages\n' \
         $(wc --bytes Packages | cut --delimiter=' ' --fields=1) >> Release
-    printf ' '$(md5sum Packages.gz | cut --delimiter=' ' --fields=1)' %16d Packages.gz\n' \
+    printf ' '$(sha256sum Packages.gz | cut --delimiter=' ' --fields=1)' %16d Packages.gz\n' \
         $(wc --bytes Packages.gz | cut --delimiter=' ' --fields=1) >> Release
-    printf ' '$(md5sum Sources | cut --delimiter=' ' --fields=1)' %16d Sources\n' \
+    printf ' '$(sha256sum Sources | cut --delimiter=' ' --fields=1)' %16d Sources\n' \
         $(wc --bytes Sources | cut --delimiter=' ' --fields=1) >> Release
-    printf ' '$(md5sum Sources.gz | cut --delimiter=' ' --fields=1)' %16d Sources.gz\n' \
+    printf ' '$(sha256sum Sources.gz | cut --delimiter=' ' --fields=1)' %16d Sources.gz\n' \
         $(wc --bytes Sources.gz | cut --delimiter=' ' --fields=1) >> Release
     gpg --armor --detach-sign --output Release.gpg Release
     cd -
 
     sudo echo
-    sudo ${GEM_EPHEM_CMD} -o $GEM_EPHEM_NAME -d 2>&1 | tee /tmp/packager.eph.$$.log &
+    sudo ${GEM_EPHEM_EXE} 2>&1 | tee /tmp/packager.eph.$$.log &
     _lxc_name_and_ip_get /tmp/packager.eph.$$.log
 
     _wait_ssh $lxc_ip
@@ -822,7 +1000,7 @@ while [ $# -gt 0 ]; do
             ;;
         -s|--serie)
             BUILD_UBUVER="$2"
-            if [ "$BUILD_UBUVER" != "precise" -a "$BUILD_UBUVER" != "trusty" ]; then
+            if [ "$BUILD_UBUVER" != "precise" -a "$BUILD_UBUVER" != "trusty" -a "$BUILD_UBUVER" != "xenial" ]; then
                 echo
                 echo "ERROR: ubuntu version '$BUILD_UBUVER' not supported"
                 echo
@@ -859,6 +1037,12 @@ while [ $# -gt 0 ]; do
         pkgtest)
             # Sed removes 'origin/' from the branch name
             pkgtest_run $(echo "$2" | sed 's@.*/@@g')
+            exit $?
+            break
+            ;;
+        builddoc)
+            # Sed removes 'origin/' from the branch name
+            builddoc_run $(echo "$2" | sed 's@.*/@@g')
             exit $?
             break
             ;;
@@ -991,17 +1175,13 @@ if [ 0 -eq 1 ]; then
     # mods pre-packaging
     mv LICENSE         openquake
     mv README.md       openquake/README
-    mv celeryconfig.py openquake
-    mv openquake.cfg   openquake
-
-    mv bin/openquake   bin/oqscript.py
     mv bin             openquake/bin
 
     rm -rf $(find demos -mindepth 1 -maxdepth 1 | egrep -v 'demos/simple_fault_demo_hazard|demos/event_based_hazard|demos/_site_model')
 fi
 
 if [ $BUILD_ON_LXC -eq 1 ]; then
-    sudo ${GEM_EPHEM_CMD} -o $GEM_EPHEM_NAME -d 2>&1 | tee /tmp/packager.eph.$$.log &
+    sudo ${GEM_EPHEM_EXE} 2>&1 | tee /tmp/packager.eph.$$.log &
     _lxc_name_and_ip_get /tmp/packager.eph.$$.log
     _wait_ssh $lxc_ip
 

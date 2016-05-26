@@ -1,29 +1,30 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014-2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import logging
 import unittest
+import platform
 
 import numpy
 
 from openquake.calculators import base
-from openquake.baselib.performance import PerformanceMonitor
+from openquake.baselib.performance import Monitor
 from openquake.commonlib import readinput, oqvalidation, datastore
 
 
@@ -31,19 +32,24 @@ class DifferentFiles(Exception):
     pass
 
 
+def check_platform(*supported):
+    """
+    Skip the test if the platform is not the reference one
+    """
+    if platform.dist()[-1] not in supported:
+        raise unittest.SkipTest
+
+
 def columns(line):
     data = []
     for column in line.split(','):
-        data.append(numpy.array(list(map(float, column.split(' ')))))
+        try:
+            floats = list(map(float, column.split(' ')))
+        except ValueError:  # skip header
+            pass
+        else:
+            data.append(numpy.array(floats))
     return data
-
-
-def get_datastore(calc):
-    ds = datastore.DataStore(calc.datastore.calc_id)
-    hc_id = ds.attrs.get('hazard_calculation_id')
-    if hc_id:
-        ds.parent = datastore.DataStore(int(hc_id))
-    return ds
 
 
 class CalculatorTestCase(unittest.TestCase):
@@ -58,10 +64,13 @@ class CalculatorTestCase(unittest.TestCase):
         inis = [os.path.join(self.testdir, ini) for ini in job_ini.split(',')]
         params = readinput.get_params(inis)
         params.update(kw)
+
+        oqvalidation.OqParam.calculation_mode.validator.choices = tuple(
+            base.calculators)
         oq = oqvalidation.OqParam(**params)
         oq.validate()
         # change this when debugging the test
-        monitor = PerformanceMonitor(self.testdir)
+        monitor = Monitor(self.testdir)
         return base.calculators(oq, monitor)
 
     def run_calc(self, testfile, job_ini, **kw):
@@ -71,12 +80,18 @@ class CalculatorTestCase(unittest.TestCase):
         inis = job_ini.split(',')
         assert len(inis) in (1, 2), inis
         self.calc = self.get_calc(testfile, inis[0], **kw)
-        result = self.calc.run()
+        with self.calc.monitor:
+            result = self.calc.run()
         if len(inis) == 2:
             hc_id = self.calc.datastore.calc_id
             self.calc = self.get_calc(
-                testfile, inis[1], hazard_calculation_id=hc_id, **kw)
-            result.update(self.calc.run())
+                testfile, inis[1], hazard_calculation_id=str(hc_id), **kw)
+            with self.calc.monitor:
+                result.update(self.calc.run())
+        # reopen datastore, since some tests need to export from it
+        dstore = datastore.read(self.calc.datastore.calc_id)
+        dstore.export_dir = dstore['oqparam'].export_dir
+        self.calc.datastore = dstore
         return result
 
     def execute(self, testfile, job_ini):

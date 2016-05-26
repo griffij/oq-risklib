@@ -1,20 +1,21 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-#  Copyright (c) 2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 """
 Source model XML Writer
 """
@@ -169,6 +170,43 @@ def build_truncated_gr_mfd(mfd):
     return LiteralNode("truncGutenbergRichterMFD",
                        {"aValue": mfd.a_val, "bValue": mfd.b_val,
                         "minMag": mfd.min_mag, "maxMag": mfd.max_mag})
+
+
+@obj_to_node.add('ArbitraryMFD')
+def build_arbitrary_mfd(mfd):
+    """
+    Parses the arbitrary MFD as a Node
+    param mfd:
+        MFD as instance of :class:
+        openquake.hazardlib.mfd.arbitrary.ArbitraryMFD
+    :returns:
+        Instance of :class: openquake.commonlib.node.Node
+    """
+    magnitudes = LiteralNode("magnitudes", text=mfd.magnitudes)
+    occur_rates = LiteralNode("occurRates", text=mfd.occurrence_rates)
+    return LiteralNode("arbitraryMFD",
+                       nodes=[magnitudes, occur_rates])
+
+
+@obj_to_node.add("YoungsCoppersmith1985MFD")
+def build_youngs_coppersmith_mfd(mfd):
+    """
+    Parses the Youngs & Coppersmith MFD as a node. Note that the MFD does
+    not hold the total moment rate, but only the characteristic rate. Therefore
+    the node is written to the characteristic rate version regardless of
+    whether or not it was originally created from total moment rate
+    :param mfd:
+        MFD as instance of :class:
+        openquake.hazardlib.mfd.youngs_coppersmith_1985.
+        YoungsCoppersmith1985MFD
+    :returns:
+        Instance of :class: openquake.commonlib.node.Node
+    """
+    return LiteralNode("YoungsCoppersmithMFD",
+                       {"minMag": mfd.min_mag, "bValue": mfd.b_val,
+                        "characteristicMag": mfd.char_mag,
+                        "characteristicRate": mfd.char_rate,
+                        "binWidth": mfd.bin_width})
 
 
 def build_nodal_plane_dist(npd):

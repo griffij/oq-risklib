@@ -1,4 +1,7 @@
-# Copyright (c) 2010-2014, GEM Foundation.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2010-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -8,13 +11,12 @@
 # OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import os
-import mock
 import unittest
 from io import BytesIO
 
@@ -31,7 +33,8 @@ from openquake.hazardlib.tom import PoissonTOM
 
 from openquake.commonlib import tests, nrml_examples, readinput
 from openquake.commonlib import sourceconverter as s
-from openquake.commonlib.source import parse_source_model, DuplicatedID
+from openquake.commonlib.source import (
+    SourceModelParser, DuplicatedID, CompositionInfo)
 from openquake.commonlib.nrml import nodefactory
 from openquake.commonlib.node import read_nodes
 from openquake.baselib.general import assert_close
@@ -41,6 +44,8 @@ NRML_DIR = os.path.dirname(nrml_examples.__file__)
 
 # Test NRML to use (contains 1 of each source type).
 MIXED_SRC_MODEL = os.path.join(NRML_DIR, 'source_model/mixed.xml')
+ALT_MFDS_SRC_MODEL = os.path.join(NRML_DIR,
+                                  'source_model/alternative-mfds.xml')
 
 DUPLICATE_ID_SRC_MODEL = os.path.join(
     os.path.dirname(__file__), 'data', 'invalid_source_model.xml')
@@ -73,17 +78,17 @@ class NrmlSourceToHazardlibTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.converter = s.SourceConverter(
+        cls.parser = SourceModelParser(s.SourceConverter(
             investigation_time=50.,
             rupture_mesh_spacing=1,  # km
             complex_fault_mesh_spacing=1,  # km
             width_of_mfd_bin=1.,  # for Truncated GR MFDs
             area_source_discretization=1.,  # km
-        )
+        ))
         source_nodes = read_nodes(MIXED_SRC_MODEL, filter_sources, ValidNode)
         (cls.area, cls.point, cls.simple, cls.cmplx, cls.char_simple,
          cls.char_complex, cls.char_multi) = map(
-            cls.converter.convert_node, source_nodes)
+            cls.parser.converter.convert_node, source_nodes)
         # the parameters here would typically be specified in the job .ini
         cls.investigation_time = 50.
         cls.rupture_mesh_spacing = 1  # km
@@ -369,16 +374,15 @@ class NrmlSourceToHazardlibTestCase(unittest.TestCase):
         assert_close(self._expected_char_multi, self.char_multi)
 
     def test_duplicate_id(self):
-        converter = s.SourceConverter(  # different from self.converter
+        parser = SourceModelParser(s.SourceConverter(
             investigation_time=50.,
             rupture_mesh_spacing=1,
             complex_fault_mesh_spacing=1,
             width_of_mfd_bin=0.1,
             area_source_discretization=10,
-        )
+        ))
         with self.assertRaises(DuplicatedID):
-            parse_source_model(
-                DUPLICATE_ID_SRC_MODEL, converter)
+            parser.parse_sources(DUPLICATE_ID_SRC_MODEL)
 
     def test_raises_useful_error_1(self):
         area_file = BytesIO(b"""\
@@ -474,7 +478,7 @@ class NrmlSourceToHazardlibTestCase(unittest.TestCase):
 """)
         [area] = read_nodes(area_file, filter_sources, ValidNode)
         with self.assertRaises(NameError) as ctx:
-            self.converter.convert_node(area)
+            self.parser.converter.convert_node(area)
         self.assertIn(
             "node areaSource: No subnode named 'nodalPlaneDist'"
             " found in 'areaSource', line 5 of", str(ctx.exception))
@@ -535,7 +539,7 @@ class NrmlSourceToHazardlibTestCase(unittest.TestCase):
         msg = ('node simpleFaultSource: hypo_list and slip_list have to be '
                'both given')
         with self.assertRaises(ValueError) as ctx:
-            parse_source_model(simple_file, self.converter)
+            self.parser.parse_sources(simple_file)
         self.assertIn(msg, str(ctx.exception))
 
     def test_nonparametric_source_ok(self):
@@ -548,6 +552,34 @@ class NrmlSourceToHazardlibTestCase(unittest.TestCase):
         np, = read_nodes(NONPARAMETRIC_SOURCE, filter_sources, ValidNode)
         converter.convert_node(np)
 
+    def test_alternative_mfds(self):
+        converter = s.SourceConverter(
+            investigation_time=1.,
+            rupture_mesh_spacing=1,  # km
+            complex_fault_mesh_spacing=5,  # km
+            width_of_mfd_bin=0.1,  # for Truncated GR MFDs
+            area_source_discretization=1.)
+        source_nodes = read_nodes(ALT_MFDS_SRC_MODEL,
+                                  filter_sources,
+                                  ValidNode)
+        [cplx1, sflt1, sflt2] = map(converter.convert_node, source_nodes)
+        # Check the values
+        # Arbitrary MFD
+        assert_close(cplx1.mfd.magnitudes, [8.6, 8.8, 9.0])
+        assert_close(cplx1.mfd.occurrence_rates, [0.0006, 0.0008, 0.0004])
+        # Youngs & Coppersmith from characteristic rate
+        self.assertAlmostEqual(sflt1.mfd.b_val, 1.0)
+        self.assertAlmostEqual(sflt1.mfd.a_val, 3.3877843113)
+        self.assertAlmostEqual(sflt1.mfd.char_mag, 7.0)
+        self.assertAlmostEqual(sflt1.mfd.char_rate, 0.005)
+        self.assertAlmostEqual(sflt1.mfd.min_mag, 5.0)
+        # Youngs & Coppersmith from total moment rate
+        self.assertAlmostEqual(sflt2.mfd.b_val, 1.0)
+        self.assertAlmostEqual(sflt2.mfd.a_val, 5.0800, 3)
+        self.assertAlmostEqual(sflt2.mfd.char_mag, 7.0)
+        self.assertAlmostEqual(sflt2.mfd.char_rate, 0.24615, 5)
+        self.assertAlmostEqual(sflt2.mfd.min_mag, 5.0)
+ 
 
 class AreaToPointsTestCase(unittest.TestCase):
     """
@@ -640,15 +672,14 @@ class TrtModelTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.converter = s.SourceConverter(
+        cls.parser = SourceModelParser(s.SourceConverter(
             investigation_time=50.,
             rupture_mesh_spacing=1,  # km
             complex_fault_mesh_spacing=1,  # km
             width_of_mfd_bin=1.,  # for Truncated GR MFDs
-            area_source_discretization=1.)
-        cls.source_collector = dict(
-            (sc.trt, sc) for sc in parse_source_model(
-                MIXED_SRC_MODEL, cls.converter, lambda src: None))
+            area_source_discretization=1.))
+        cls.source_collector = {
+            sc.trt: sc for sc in cls.parser.parse_trt_models(MIXED_SRC_MODEL)}
         cls.sitecol = site.SiteCollection(cls.SITES)
 
     def check(self, trt, attr, value):
@@ -672,25 +703,23 @@ class TrtModelTestCase(unittest.TestCase):
         self.check('Stable Continental Crust', 'min_mag', 5.5)
         self.check('Active Shallow Crust', 'min_mag', 5.0)
 
-        self.check('Volcanic', 'num_ruptures', 0)
-        self.check('Subduction Interface', 'num_ruptures', 0)
-        self.check('Stable Continental Crust', 'num_ruptures', 0)
-        self.check('Active Shallow Crust', 'num_ruptures', 0)
-
     def test_repr(self):
         self.assertEqual(
             repr(self.source_collector['Volcanic']),
-            '<TrtModel #0 Volcanic, 3 source(s), 0 rupture(s)>')
+            '<TrtModel #0 Volcanic, 3 source(s), -1 effective rupture(s)>')
         self.assertEqual(
             repr(self.source_collector['Stable Continental Crust']),
-            '<TrtModel #0 Stable Continental Crust, 1 source(s), 0 rupture(s)>'
+            '<TrtModel #0 Stable Continental Crust, 1 source(s), '
+            '-1 effective rupture(s)>'
         )
         self.assertEqual(
             repr(self.source_collector['Subduction Interface']),
-            '<TrtModel #0 Subduction Interface, 1 source(s), 0 rupture(s)>')
+            '<TrtModel #0 Subduction Interface, 1 source(s), '
+            '-1 effective rupture(s)>')
         self.assertEqual(
             repr(self.source_collector['Active Shallow Crust']),
-            '<TrtModel #0 Active Shallow Crust, 2 source(s), 0 rupture(s)>')
+            '<TrtModel #0 Active Shallow Crust, 2 source(s), -1'
+            ' effective rupture(s)>')
 
 
 class RuptureConverterTestCase(unittest.TestCase):
@@ -740,17 +769,16 @@ class CompositeSourceModelTestCase(unittest.TestCase):
         # the example has number_of_logic_tree_samples = 1
         sitecol = readinput.get_site_collection(oqparam)
         csm = readinput.get_composite_source_model(oqparam, sitecol)
-        self.assertEqual(str(csm[0].gsim_lt), '''\
+        self.assertEqual(repr(csm[0].gsim_lt), '''\
 <GsimLogicTree
-Active Shallow Crust,b1,SadighEtAl1997,w=0.5
-Active Shallow Crust,b2,ChiouYoungs2008,w=0.5
-Subduction Interface,b3,SadighEtAl1997,w=1.0>''')
-        assoc = csm.get_rlzs_assoc(
-            lambda trtmod: sum(src.count_ruptures() for src in trtmod.sources))
+Active Shallow Crust,b1,SadighEtAl1997(),w=0.5
+Active Shallow Crust,b2,ChiouYoungs2008(),w=0.5
+Subduction Interface,b3,SadighEtAl1997(),w=1.0>''')
+        assoc = csm.info.get_rlzs_assoc()
         [rlz] = assoc.realizations
         self.assertEqual(assoc.gsim_by_trt[rlz.ordinal],
-                         {'Subduction Interface': 'SadighEtAl1997',
-                          'Active Shallow Crust': 'ChiouYoungs2008'})
+                         {'Subduction Interface': 'SadighEtAl1997()',
+                          'Active Shallow Crust': 'ChiouYoungs2008()'})
         # ignoring the end of the tuple, with the uid field
         self.assertEqual(rlz.ordinal, 0)
         self.assertEqual(rlz.sm_lt_path, ('b1', 'b5', 'b8'))
@@ -758,8 +786,9 @@ Subduction Interface,b3,SadighEtAl1997,w=1.0>''')
         self.assertEqual(rlz.weight, 1.)
         self.assertEqual(
             str(assoc),
-            "<RlzsAssoc(2)\n0,SadighEtAl1997: ['<0,b1_b5_b8,b2_b3,w=1.0>']\n"
-            "1,ChiouYoungs2008: ['<0,b1_b5_b8,b2_b3,w=1.0>']>")
+            "<RlzsAssoc(size=2, rlzs=1)\n0,SadighEtAl1997(): "
+            "['<0,b1_b5_b8,b2_b3,w=1.0>']\n"
+            "1,ChiouYoungs2008(): ['<0,b1_b5_b8,b2_b3,w=1.0>']>")
 
     def test_many_rlzs(self):
         oqparam = tests.get_oqparam('classical_job.ini')
@@ -768,64 +797,64 @@ Subduction Interface,b3,SadighEtAl1997,w=1.0>''')
         csm = readinput.get_composite_source_model(oqparam, sitecol)
         self.assertEqual(len(csm), 9)  # the smlt example has 1 x 3 x 3 paths;
         # there are 2 distinct tectonic region types, so 18 trt_models
-        rlzs_assoc = csm.get_rlzs_assoc()
+        self.assertEqual(sum(1 for tm in csm.trt_models), 18)
+
+        rlzs_assoc = csm.info.get_rlzs_assoc()
         rlzs = rlzs_assoc.realizations
         self.assertEqual(len(rlzs), 18)  # the gsimlt has 1 x 2 paths
-        self.assertEqual([1, 14, 1, 14, 1, 14, 1, 12, 1, 12,
-                          1, 12, 1, 12, 1, 12, 1, 12],
-                         list(map(len, csm.trt_models)))
+        # counting the sources in each TRT model (unsplit)
+        self.assertEqual(
+            [1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2],
+            list(map(len, csm.trt_models)))
 
-        # test the method get_col_ids
-        col_ids_first = rlzs_assoc.get_col_ids(rlzs[0])
-        self.assertEqual(col_ids_first, set([0, 1]))
-        col_ids_last = rlzs_assoc.get_col_ids(rlzs[-1])
-        self.assertEqual(col_ids_last, set([16, 17]))
+        # test the method extract
+        assoc = rlzs_assoc.extract([1, 5], csm.info)
+        self.assertEqual(str(assoc), """\
+<RlzsAssoc(size=4, rlzs=2)
+0,SadighEtAl1997(): ['<1,b1_b3_b6,b2_b3,w=0.5>']
+1,ChiouYoungs2008(): ['<1,b1_b3_b6,b2_b3,w=0.5>']
+4,SadighEtAl1997(): ['<5,b1_b3_b8,b2_b3,w=0.5>']
+5,ChiouYoungs2008(): ['<5,b1_b3_b8,b2_b3,w=0.5>']>""")
 
         # removing 9 trt_models out of 18
-        for trt_model in csm.trt_models:
+        def count_ruptures(trt_model):
             if trt_model.trt == 'Active Shallow Crust':  # no ruptures
-                trt_model.num_ruptures = 0
-        assoc = csm.get_rlzs_assoc()
-
+                return 0
+            else:
+                return 1
+        assoc = csm.info.get_rlzs_assoc(count_ruptures)
         expected_assoc = """\
-<RlzsAssoc(9)
-0,SadighEtAl1997: ['<0,b1_b3_b6,@_b3,w=0.04>']
-2,SadighEtAl1997: ['<1,b1_b3_b7,@_b3,w=0.12>']
-4,SadighEtAl1997: ['<2,b1_b3_b8,@_b3,w=0.04>']
-6,SadighEtAl1997: ['<3,b1_b4_b6,@_b3,w=0.12>']
-8,SadighEtAl1997: ['<4,b1_b4_b7,@_b3,w=0.36>']
-10,SadighEtAl1997: ['<5,b1_b4_b8,@_b3,w=0.12>']
-12,SadighEtAl1997: ['<6,b1_b5_b6,@_b3,w=0.04>']
-14,SadighEtAl1997: ['<7,b1_b5_b7,@_b3,w=0.12>']
-16,SadighEtAl1997: ['<8,b1_b5_b8,@_b3,w=0.04>']>"""
+<RlzsAssoc(size=9, rlzs=9)
+0,SadighEtAl1997(): ['<0,b1_b3_b6,@_b3,w=0.04>']
+2,SadighEtAl1997(): ['<1,b1_b3_b7,@_b3,w=0.12>']
+4,SadighEtAl1997(): ['<2,b1_b3_b8,@_b3,w=0.04>']
+6,SadighEtAl1997(): ['<3,b1_b4_b6,@_b3,w=0.12>']
+8,SadighEtAl1997(): ['<4,b1_b4_b7,@_b3,w=0.36>']
+10,SadighEtAl1997(): ['<5,b1_b4_b8,@_b3,w=0.12>']
+12,SadighEtAl1997(): ['<6,b1_b5_b6,@_b3,w=0.04>']
+14,SadighEtAl1997(): ['<7,b1_b5_b7,@_b3,w=0.12>']
+16,SadighEtAl1997(): ['<8,b1_b5_b8,@_b3,w=0.04>']>"""
         self.assertEqual(str(assoc), expected_assoc)
         self.assertEqual(len(assoc.realizations), 9)
 
         # removing all trt_models
-        for trt_model in csm.trt_models:
-            if trt_model.trt == 'Subduction Interface':  # no ruptures
-                trt_model.num_ruptures = 0
-        self.assertEqual(csm.get_rlzs_assoc().realizations, [])
+        self.assertEqual(csm.info.get_rlzs_assoc(lambda t: 0).realizations, [])
 
     def test_oversampling(self):
         from openquake.qa_tests_data.classical import case_17
         oq = readinput.get_oqparam(
             os.path.join(os.path.dirname(case_17.__file__), 'job.ini'))
         sitecol = readinput.get_site_collection(oq)
-        with mock.patch('logging.warn') as warn:
-            csm = readinput.get_composite_source_model(oq, sitecol)
-        messages = [args[0][0] % args[0][1:] for args in warn.call_args_list]
-        self.assertEqual(
-            messages, ["The source path ('b2',) was sampled 4 times"])
-        assoc = csm.get_rlzs_assoc()
+        csm = readinput.get_composite_source_model(oq, sitecol)
+        assoc = csm.info.get_rlzs_assoc(lambda tm: 1)
         self.assertEqual(
             str(assoc),
-            "<RlzsAssoc(2)\n"
-            "0,SadighEtAl1997: ['<0,b1,b1,w=0.2>']\n"
-            "1,SadighEtAl1997: ['<1,b2,b1,w=0.2>', '<2,b2,b1,w=0.2>', '<3,b2,b1,w=0.2>', '<4,b2,b1,w=0.2>']>")
+            "<RlzsAssoc(size=2, rlzs=5)\n"
+            "0,SadighEtAl1997(): ['<0,b1,b1,w=0.2>']\n"
+            "1,SadighEtAl1997(): ['<1,b2,b1,w=0.2>', '<2,b2,b1,w=0.2>', '<3,b2,b1,w=0.2>', '<4,b2,b1,w=0.2>']>")
 
-        # test the method get_col_ids
-        col_ids_first = assoc.get_col_ids(assoc.realizations[0])
-        self.assertEqual(col_ids_first, set([0]))
-        col_ids_last = assoc.get_col_ids(assoc.realizations[-1])
-        self.assertEqual(col_ids_last, set([4]))
+        # check CompositionInfo serialization
+        dic, attrs = csm.info.__toh5__()
+        new = object.__new__(CompositionInfo)
+        new.__fromh5__(dic, attrs)
+        self.assertEqual(repr(new), repr(csm.info))

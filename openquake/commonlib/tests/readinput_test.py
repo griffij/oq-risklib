@@ -1,20 +1,20 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-#  Copyright (c) 2014, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import shutil
@@ -31,6 +31,10 @@ from openquake.baselib import general
 
 TMP = tempfile.gettempdir()
 DATADIR = os.path.join(os.path.dirname(__file__), 'data')
+
+
+def getparams(oq):
+    return {k: v for k, v in vars(oq).items() if not k.startswith('_')}
 
 
 class ParseConfigTestCase(unittest.TestCase):
@@ -63,19 +67,19 @@ export_dir = %s
                 'calculation_mode': 'event_based',
                 'truncation_level': 0.0,
                 'random_seed': 0,
-                'maximum_distance': 1.0,
+                'maximum_distance': {'default': 1},
                 'inputs': {'job_ini': job_config,
                            'site_model': site_model_input},
                 'sites': [(0.0, 0.0)],
                 'hazard_imtls': {'PGA': None},
-                'risk_imtls': {},
                 'investigation_time': 50.0,
                 'risk_investigation_time': 50.0,
             }
 
             with mock.patch('logging.warn') as warn:
-                params = vars(readinput.get_oqparam(job_config))
-                self.assertEqual(expected_params, params)
+                params = getparams(readinput.get_oqparam(job_config))
+                for key in expected_params:
+                    self.assertEqual(expected_params[key], params[key])
                 items = sorted(params['inputs'].items())
                 keys, values = zip(*items)
                 self.assertEqual(('job_ini', 'site_model'), keys)
@@ -117,7 +121,7 @@ export_dir = %s
                 'calculation_mode': 'classical',
                 'truncation_level': 3.0,
                 'random_seed': 5,
-                'maximum_distance': 1.0,
+                'maximum_distance': {'default': 1},
                 'inputs': {'job_ini': source,
                            'sites': sites_csv},
                 'reference_depth_to_1pt0km_per_sec': 100.0,
@@ -125,12 +129,11 @@ export_dir = %s
                 'reference_vs30_type': 'measured',
                 'reference_vs30_value': 600.0,
                 'hazard_imtls': {'PGA': [0.1, 0.2]},
-                'risk_imtls': {},
                 'investigation_time': 50.0,
                 'risk_investigation_time': 50.0,
             }
 
-            params = vars(readinput.get_oqparam(source))
+            params = getparams(readinput.get_oqparam(source))
             self.assertEqual(expected_params, params)
         finally:
             os.unlink(sites_csv)
@@ -155,54 +158,6 @@ investigation_time = 50.
         with self.assertRaises(ValueError) as ctx:
             readinput.get_site_collection(oqparam)
         self.assertIn('Could not discretize region', str(ctx.exception))
-
-    def test_get_rlzs_assoc(self):
-        two_trts = general.writetmp("""\
-<?xml version='1.0' encoding='utf-8'?>
-<nrml xmlns:gml="http://www.opengis.net/gml"
-      xmlns="http://openquake.org/xmlns/nrml/0.4">
-    <logicTree logicTreeID='lt1'>
-        <logicTreeBranchingLevel branchingLevelID="bl1">
-            <logicTreeBranchSet uncertaintyType="gmpeModel" branchSetID="bs1"
-                    applyToTectonicRegionType="Active Shallow Crust">
-
-                <logicTreeBranch branchID="b1">
-                    <uncertaintyModel>BooreAtkinson2008</uncertaintyModel>
-                    <uncertaintyWeight>0.75</uncertaintyWeight>
-                </logicTreeBranch>
-                <logicTreeBranch branchID="b2">
-                    <uncertaintyModel>ChiouYoungs2008</uncertaintyModel>
-                    <uncertaintyWeight>0.25</uncertaintyWeight>
-                </logicTreeBranch>
-
-            </logicTreeBranchSet>
-        </logicTreeBranchingLevel>
-
-        <logicTreeBranchingLevel branchingLevelID="bl2">
-            <logicTreeBranchSet uncertaintyType="gmpeModel" branchSetID="bs2"
-                    applyToTectonicRegionType="Active Deep Crust">
-
-                <logicTreeBranch branchID="b1">
-                    <uncertaintyModel>BooreAtkinson2008</uncertaintyModel>
-                    <uncertaintyWeight>0.75</uncertaintyWeight>
-                </logicTreeBranch>
-
-                <logicTreeBranch branchID="b2">
-                    <uncertaintyModel>ChiouYoungs2008</uncertaintyModel>
-                    <uncertaintyWeight>0.25</uncertaintyWeight>
-                </logicTreeBranch>
-
-            </logicTreeBranchSet>
-        </logicTreeBranchingLevel>
-    </logicTree>
-</nrml>""")
-        oqparam = mock.Mock()
-        oqparam.base_path = '/'
-        oqparam.inputs = dict(gsim_logic_tree=two_trts)
-        with self.assertRaises(readinput.InvalidFile) as ctx:
-            readinput.get_rlzs_assoc(oqparam)
-        self.assertIn('must contain a single tectonic region type',
-                      str(ctx.exception))
 
 
 def sitemodel():
@@ -337,8 +292,21 @@ class ExposureTestCase(unittest.TestCase):
   </exposureModel>
 </nrml>''')
 
+    exposure2 = general.writetmp('''\
+<?xml version='1.0' encoding='UTF-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.5">
+  <exposureModel id="ep" category="buildings">
+    <description>Exposure model for buildings</description>
+    <conversions>
+      <costTypes>
+        <costType name="structural" unit="USD" type="aggregate"/>
+      </costTypes>
+    </conversions>
+  </exposureModel>
+</nrml>''')  # wrong cost type "aggregate"
+
     def test_get_exposure_metadata(self):
-        exp, _assets = readinput.get_exposure_lazy(
+        exp, _assets, _cc = readinput.get_exposure_lazy(
             self.exposure, ['structural'])
         self.assertEqual(exp.description, 'Exposure model for buildings')
         self.assertTrue(exp.insurance_limit_is_absolute)
@@ -425,6 +393,21 @@ POLYGON((68.0 31.5, 69.5 31.5, 69.5 25.5, 68.0 25.5, 68.0 31.5))'''
         with self.assertRaises(RuntimeError) as ctx:
             readinput.get_exposure(oqparam)
         self.assertIn('Could not find any asset within the region!',
+                      str(ctx.exception))
+
+    def test_exposure_wrong_cost_type(self):
+        oqparam = mock.Mock()
+        oqparam.base_path = '/'
+        oqparam.calculation_mode = 'scenario_risk'
+        oqparam.all_cost_types = ['structural']
+        oqparam.region_constraint = '''\
+POLYGON((68.0 31.5, 69.5 31.5, 69.5 25.5, 68.0 25.5, 68.0 31.5))'''
+        oqparam.inputs = {'exposure': self.exposure2,
+                          'structural_vulnerability': None}
+        with self.assertRaises(ValueError) as ctx:
+            readinput.get_exposure(oqparam)
+        self.assertIn("node costType: Got 'aggregate', expected "
+                      "aggregated|per_area|per_asset, line 7",
                       str(ctx.exception))
 
 
@@ -569,7 +552,7 @@ PGA 12.0 42.2 0.64 0.65
                                       [0.55, 0.51, 0.5]])
 
 
-class TestReadGmfTestCase(unittest.TestCase):
+class TestReadGmfCsvTestCase(unittest.TestCase):
     def setUp(self):
         self.oqparam = mock.Mock()
         self.oqparam.base_path = '/'
@@ -620,7 +603,7 @@ col=00|ses=0001|src=test|rup=001-01,0 1,2.67031000E-01 3.34878000E-01
         with self.assertRaises(readinput.InvalidFile):
             readinput.get_gmfs_from_txt(self.oqparam, fname)
 
-    def test_not_ordered_tags(self):
+    def test_not_ordered_etags(self):
         fname = general.writetmp('''\
 0 0,0 1
 col=00|ses=0001|src=test|rup=001-02,0 1,1.59434000E-01 3.92602000E-01
@@ -651,7 +634,7 @@ col=00|ses=0001|src=test|rup=001-02,X,2.67031000E-01
             readinput.get_gmfs_from_txt(self.oqparam, fname)
 
 
-class TestLoadGmfTestCase(unittest.TestCase):
+class TestReadGmfXmlTestCase(unittest.TestCase):
     """
     Read the GMF from a NRML file
     """
@@ -664,14 +647,14 @@ class TestLoadGmfTestCase(unittest.TestCase):
 
     def test_ok(self):
         fname = os.path.join(DATADIR,  'gmfdata.xml')
-        sitecol, tags, gmfa = readinput.get_scenario_from_nrml(
+        sitecol, etags, gmfa = readinput.get_scenario_from_nrml(
             self.oqparam, fname)
         coords = zip(sitecol.mesh.lons, sitecol.mesh.lats)
         self.assertEqual(writers.write_csv(StringIO(), coords), '''\
-0.00000000E+00,0.00000000E+00
-0.00000000E+00,1.00000000E-01
-0.00000000E+00,2.00000000E-01''')
-        self.assertEqual('\n'.join(tags), '''\
+0.000000E+00,0.000000E+00
+0.000000E+00,1.000000E-01
+0.000000E+00,2.000000E-01''')
+        self.assertEqual('\n'.join(etags), '''\
 scenario-0000000000
 scenario-0000000001
 scenario-0000000002
@@ -679,17 +662,17 @@ scenario-0000000003
 scenario-0000000004''')
         self.assertEqual(
             writers.write_csv(StringIO(), gmfa), '''\
-PGV:float64:,PGA:float64:
-6.82495715E-01 3.65662735E-01 8.70083359E-01 3.27929201E-01 6.96868642E-01,6.82495715E-01 3.65662735E-01 8.70083359E-01 3.27929201E-01 6.96868642E-01
-1.27089832E-01 2.56181252E-01 2.10638411E-01 2.35755152E-01 2.58140526E-01,1.27089832E-01 2.56181252E-01 2.10638411E-01 2.35755152E-01 2.58140526E-01
-1.60309678E-01 1.10685275E-01 2.23217460E-01 1.78114255E-01 1.35164914E-01,1.60309678E-01 1.10685275E-01 2.23217460E-01 1.78114255E-01 1.35164914E-01''')
+PGV,PGA
+6.824957E-01 3.656627E-01 8.700833E-01 3.279292E-01 6.968687E-01,6.824957E-01 3.656627E-01 8.700833E-01 3.279292E-01 6.968687E-01
+1.270898E-01 2.561812E-01 2.106384E-01 2.357551E-01 2.581405E-01,1.270898E-01 2.561812E-01 2.106384E-01 2.357551E-01 2.581405E-01
+1.603097E-01 1.106853E-01 2.232175E-01 1.781143E-01 1.351649E-01,1.603097E-01 1.106853E-01 2.232175E-01 1.781143E-01 1.351649E-01''')
 
     def test_err(self):
         # missing ruptureId
         fname = os.path.join(DATADIR,  'gmfdata_err.xml')
         with self.assertRaises(readinput.InvalidFile) as ctx:
             readinput.get_scenario_from_nrml(self.oqparam, fname)
-        self.assertIn("Found a missing tag 'scenario-0000000001'",
+        self.assertIn("Found a missing etag 'scenario-0000000001'",
                       str(ctx.exception))
 
     def test_err2(self):
@@ -697,7 +680,52 @@ PGV:float64:,PGA:float64:
         fname = os.path.join(DATADIR,  'gmfdata_err2.xml')
         with self.assertRaises(readinput.InvalidFile) as ctx:
             readinput.get_scenario_from_nrml(self.oqparam, fname)
-        self.assertIn("Expected 4 sites, got 3 in", str(ctx.exception))
+        self.assertIn("Expected 4 sites, got 3 nodes in", str(ctx.exception))
+
+    def test_tricky_ordering(self):
+        # see https://github.com/gem/oq-risklib/issues/546
+        fname = general.writetmp('''\
+<?xml version="1.0" encoding="utf-8"?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4"
+      xmlns:gml="http://www.opengis.net/gml">
+<gmfCollection gsimTreePath="" sourceModelTreePath="">
+  <gmfSet stochasticEventSetId="1">
+    <gmf IMT="PGA" ruptureId="scenario-0">
+      <node gmv="0.0124783118478" lon="12.1244171" lat="43.58248037"/>
+      <node gmv="0.0126515007046" lon="12.12477995" lat="43.58217888"/>
+      <node gmv="0.0124056290492" lon="12.12478193" lat="43.58120146"/>
+    </gmf>
+  </gmfSet>
+</gmfCollection>
+</nrml>''')
+        self.oqparam.imtls = {'PGA': None}
+        sitecol, _, _ = readinput.get_scenario_from_nrml(self.oqparam, fname)
+        self.assertEqual(zip(sitecol.lons, sitecol.lats),
+                         [(12.12442, 43.58248),
+                          (12.12478, 43.5812),
+                          (12.12478, 43.58218)])
+        # notice that the last two lats 43.5812, 43.58218 are inverted with
+        # respect to the original ordering, 43.58217888, 43.58120146
+
+    def test_two_nodes_on_the_same_point(self):
+        # after rounding of the coordinates two points can collide
+        fname = general.writetmp('''\
+<?xml version="1.0" encoding="utf-8"?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.4"
+      xmlns:gml="http://www.opengis.net/gml">
+<gmfCollection gsimTreePath="" sourceModelTreePath="">
+  <gmfSet stochasticEventSetId="1">
+    <gmf IMT="PGA" ruptureId="scenario-0">
+      <node gmv="0.0126515007046" lon="12.12477995" lat="43.5812"/>
+      <node gmv="0.0124056290492" lon="12.12478193" lat="43.5812"/>
+    </gmf>
+  </gmfSet>
+</gmfCollection>
+</nrml>''')
+        self.oqparam.imtls = {'PGA': None}
+        with self.assertRaises(readinput.InvalidFile) as ctx:
+            readinput.get_scenario_from_nrml(self.oqparam, fname)
+        self.assertIn("Expected 1 sites, got 2 nodes in", str(ctx.exception))
 
 
 class TestLoadCurvesTestCase(unittest.TestCase):

@@ -1,5 +1,7 @@
-# coding=utf-8
-# Copyright (c) 2010-2014, GEM Foundation.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2010-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -9,10 +11,10 @@
 # OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 """
 Module containing writers for risk output artifacts.
@@ -20,6 +22,7 @@ Module containing writers for risk output artifacts.
 import json
 import operator
 import collections
+import numpy
 
 from xml.etree import ElementTree as et
 
@@ -27,7 +30,12 @@ from openquake.commonlib.nrml import NRMLFile, SERIALIZE_NS_MAP
 from openquake.baselib.general import groupby, writetmp
 from openquake.commonlib.node import Node
 from openquake.commonlib import nrml
+from openquake.commonlib.writers import FIVEDIGITS
 
+
+def notnan(value):
+    """True if the value is not numpy.nan"""
+    return not numpy.isnan(value)
 
 DmgState = collections.namedtuple("DmgState", 'dmg_state lsi')
 
@@ -71,7 +79,7 @@ class LossCurveXMLWriter(object):
     :param str loss_type:
         Loss type used in risk model input for the calculation producing this
         output (examples: structural, non-structural, business-interruption,
-        fatalities)
+        occupants)
     :param str source_model_tree_path:
         Id of the source model tree path (obtained by concatenating the IDs of
         the branches the path is made of) for which input hazard curves
@@ -98,7 +106,7 @@ class LossCurveXMLWriter(object):
     def __init__(self, dest, investigation_time, loss_type,
                  source_model_tree_path=None, gsim_tree_path=None,
                  statistics=None, quantile_value=None, unit=None,
-                 insured=False):
+                 insured=False, poe=None, risk_investigation_time=None):
 
         validate_hazard_metadata(gsim_tree_path, source_model_tree_path,
                                  statistics, quantile_value)
@@ -109,6 +117,8 @@ class LossCurveXMLWriter(object):
         self._quantile_value = quantile_value
         self._gsim_tree_path = gsim_tree_path
         self._investigation_time = investigation_time
+        self._risk_investigation_time = (
+            risk_investigation_time or investigation_time)
         self._loss_type = loss_type
         self._source_model_tree_path = source_model_tree_path
         self._insured = insured
@@ -164,23 +174,25 @@ class LossCurveXMLWriter(object):
                 loss_curve.set("assetRef", curve.asset_ref)
 
                 poes = et.SubElement(loss_curve, "poEs")
-                poes.text = " ".join([str(p) for p in curve.poes])
+                poes.text = " ".join(FIVEDIGITS % p for p in curve.poes
+                                     if notnan(p))
 
                 losses = et.SubElement(loss_curve, "losses")
-                losses.text = " ".join([str(p) for p in curve.losses])
+                losses.text = " ".join(FIVEDIGITS % p for p in curve.losses
+                                       if notnan(p))
 
                 if curve.loss_ratios is not None:
                     loss_ratios = et.SubElement(loss_curve, "lossRatios")
 
                     loss_ratios.text = " ".join(
-                        ['%.3f' % p for p in curve.loss_ratios])
+                        ['%.3f' % p for p in curve.loss_ratios if notnan(p)])
 
                 losses = et.SubElement(loss_curve, "averageLoss")
-                losses.text = "%.4e" % curve.average_loss
+                losses.text = FIVEDIGITS % curve.average_loss
 
                 if curve.stddev_loss is not None:
                     losses = et.SubElement(loss_curve, "stdDevLoss")
-                    losses.text = "%.4e" % curve.stddev_loss
+                    losses.text = FIVEDIGITS % curve.stddev_loss
 
             nrml.write(list(root), output)
 
@@ -196,6 +208,9 @@ class LossCurveXMLWriter(object):
 
         self._loss_curves.set("investigationTime",
                               str(self._investigation_time))
+
+        self._loss_curves.set("riskInvestigationTime",
+                              str(self._risk_investigation_time))
 
         if self._source_model_tree_path is not None:
             self._loss_curves.set("sourceModelTreePath",
@@ -230,7 +245,7 @@ class AggregateLossCurveXMLWriter(object):
     :param str loss_type:
         Loss type used in risk model input for the calculation producing this
         output (examples: structural, non-structural, business-interruption,
-        fatalities)
+        occupants)
     :param str source_model_tree_path:
         Id of the source model tree path (obtained by concatenating the IDs of
         the branches the path is made of) for which input hazard curves
@@ -251,7 +266,8 @@ class AggregateLossCurveXMLWriter(object):
 
     def __init__(self, dest, investigation_time, loss_type,
                  source_model_tree_path=None, gsim_tree_path=None,
-                 statistics=None, quantile_value=None, unit=None):
+                 statistics=None, quantile_value=None, unit=None, poe=None,
+                 risk_investigation_time=None):
 
         validate_hazard_metadata(gsim_tree_path, source_model_tree_path,
                                  statistics, quantile_value)
@@ -262,6 +278,8 @@ class AggregateLossCurveXMLWriter(object):
         self._quantile_value = quantile_value
         self._gsim_tree_path = gsim_tree_path
         self._investigation_time = investigation_time
+        self._risk_investigation_time = (
+            risk_investigation_time or investigation_time)
         self._loss_type = loss_type
         self._source_model_tree_path = source_model_tree_path
 
@@ -299,6 +317,9 @@ class AggregateLossCurveXMLWriter(object):
             aggregate_loss_curve.set("investigationTime",
                                      str(self._investigation_time))
 
+            aggregate_loss_curve.set("riskInvestigationTime",
+                                     str(self._risk_investigation_time))
+
             if self._source_model_tree_path is not None:
                 aggregate_loss_curve.set("sourceModelTreePath",
                                          str(self._source_model_tree_path))
@@ -320,17 +341,17 @@ class AggregateLossCurveXMLWriter(object):
             aggregate_loss_curve.set("lossType", self._loss_type)
 
             poes = et.SubElement(aggregate_loss_curve, "poEs")
-            poes.text = " ".join([str(p) for p in data.poes])
+            poes.text = " ".join(FIVEDIGITS % p for p in data.poes)
 
             losses = et.SubElement(aggregate_loss_curve, "losses")
-            losses.text = " ".join(["%.4f" % p for p in data.losses])
+            losses.text = " ".join([FIVEDIGITS % p for p in data.losses])
 
             losses = et.SubElement(aggregate_loss_curve, "averageLoss")
-            losses.text = "%.4e" % data.average_loss
+            losses.text = FIVEDIGITS % data.average_loss
 
             if data.stddev_loss is not None:
                 losses = et.SubElement(aggregate_loss_curve, "stdDevLoss")
-                losses.text = "%.4e" % data.stddev_loss
+                losses.text = FIVEDIGITS % data.stddev_loss
 
             nrml.write(list(root), output)
 
@@ -355,7 +376,7 @@ class LossMapWriter(object):
     :param str loss_type:
         Loss type used in risk model input for the calculation producing this
         output (examples: structural, non-structural, business-interruption,
-        fatalities)
+        occupants)
     :param str source_model_tree_path:
         Id of the source model tree path (obtained by concatenating the IDs of
         the branches the path is made of) for which input hazard curves
@@ -380,7 +401,7 @@ class LossMapWriter(object):
     def __init__(self, dest, investigation_time, poe, loss_type,
                  source_model_tree_path=None, gsim_tree_path=None,
                  statistics=None, quantile_value=None, unit=None,
-                 loss_category=None):
+                 loss_category=None, risk_investigation_time=None):
 
         # Relaxed constraint for scenario risk calculator
         # which doesn't have hazard metadata.
@@ -397,6 +418,8 @@ class LossMapWriter(object):
         self._quantile_value = quantile_value
         self._gsim_tree_path = gsim_tree_path
         self._investigation_time = investigation_time
+        self._risk_investigation_time = (
+            risk_investigation_time or investigation_time)
         self._source_model_tree_path = source_model_tree_path
 
     def serialize(self, data):
@@ -452,10 +475,10 @@ class LossMapXMLWriter(LossMapWriter):
                 loss_elem.set("assetRef", str(loss.asset_ref))
 
                 if loss.std_dev is not None:
-                    loss_elem.set("mean", str(loss.value))
-                    loss_elem.set("stdDev", str(loss.std_dev))
+                    loss_elem.set("mean", FIVEDIGITS % loss.value)
+                    loss_elem.set("stdDev", FIVEDIGITS % loss.std_dev)
                 else:
-                    loss_elem.set("value", str(loss.value))
+                    loss_elem.set("value", FIVEDIGITS % loss.value)
 
             nrml.write(list(root), output)
 
@@ -466,6 +489,8 @@ class LossMapXMLWriter(LossMapWriter):
 
         loss_map = et.SubElement(root, "lossMap")
         loss_map.set("investigationTime", str(self._investigation_time))
+        loss_map.set("riskInvestigationTime",
+                     str(self._risk_investigation_time))
         loss_map.set("poE", str(self._poe))
 
         if self._source_model_tree_path is not None:
@@ -584,7 +609,7 @@ class LossFractionsWriter(object):
     :param str loss_type:
         Loss type used in risk model input for the calculation producing this
         output (examples: structural, non-structural, business-interruption,
-        fatalities)
+        occupants)
     :attr str loss_category:
         Attribute describing the category (economic, population, buildings,
         etc..) of the losses producing this loss map.
@@ -630,8 +655,8 @@ class LossFractionsWriter(object):
             for value, (absolute_loss, fraction) in bin_data.items():
                 bin_element = et.SubElement(parent, "bin")
                 bin_element.set("value", str(value))
-                bin_element.set("absoluteLoss", "%.4e" % absolute_loss)
-                bin_element.set("fraction", "%.5f" % fraction)
+                bin_element.set("absoluteLoss", FIVEDIGITS % absolute_loss)
+                bin_element.set("fraction", FIVEDIGITS % fraction)
 
         with NRMLFile(self.dest, 'w') as output:
             root = et.Element("nrml")
@@ -690,7 +715,7 @@ class BCRMapXMLWriter(object):
     :param str loss_type:
         Loss type used in risk model input for the calculation producing this
         output (examples: structural, non-structural, business-interruption,
-        fatalities)
+        occupants)
     :param str source_model_tree_path:
         Id of the source model tree path (obtained by concatenating the IDs of
         the branches the path is made of) for which input hazard curves
@@ -715,7 +740,7 @@ class BCRMapXMLWriter(object):
     def __init__(self, path, interest_rate, asset_life_expectancy, loss_type,
                  source_model_tree_path=None, gsim_tree_path=None,
                  statistics=None, quantile_value=None, unit=None,
-                 loss_category=None):
+                 loss_category=None, poe=None):
 
         validate_hazard_metadata(gsim_tree_path, source_model_tree_path,
                                  statistics, quantile_value)
@@ -931,7 +956,7 @@ class DamageWriter(object):
         :returns: a `gml:Point` node
         """
         return Node('gml:Point',
-                    nodes=[Node('gml:pos', text='%s %s' % (loc.x, loc.y))])
+                    nodes=[Node('gml:pos', text='%.5f %.5f' % (loc.x, loc.y))])
 
     def asset_node(self, asset_ref, means, stddevs):
         """
@@ -1037,7 +1062,7 @@ class DamageWriter(object):
             node.append(self.cm_node(loc, asset_refs, means, stddevs))
         return node
 
-    def to_nrml(self, key, data, fname=None, fmt='%11.7E'):
+    def to_nrml(self, key, data, fname=None, fmt=FIVEDIGITS):
         """
         :param key:
          `dmg_dist_per_asset|dmg_dist_per_taxonomy|dmg_dist_total|collapse_map`

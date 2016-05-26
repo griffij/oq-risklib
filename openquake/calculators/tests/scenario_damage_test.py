@@ -1,4 +1,23 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 import os
+import unittest
 from nose.plugins.attrib import attr
 
 from openquake.qa_tests_data.scenario_damage import (
@@ -6,6 +25,13 @@ from openquake.qa_tests_data.scenario_damage import (
     case_6, case_7)
 
 from openquake.calculators.tests import CalculatorTestCase
+
+try:
+    from shapely.geos import geos_version
+except:
+    old_geos = True
+else:
+    old_geos = geos_version < (3, 4, 2)
 
 
 class ScenarioDamageTestCase(CalculatorTestCase):
@@ -45,6 +71,10 @@ class ScenarioDamageTestCase(CalculatorTestCase):
 
     @attr('qa', 'risk', 'scenario_damage')
     def test_case_3(self):
+        if old_geos:
+            # in Ubuntu 12.04 avoid a mysterious finalization segfault
+            # due to HDF5 that only happens in this test
+            raise unittest.SkipTest
         self.assert_ok(case_3, 'job_risk.ini')
 
     @attr('qa', 'risk', 'scenario_damage')

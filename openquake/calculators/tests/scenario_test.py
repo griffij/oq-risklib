@@ -1,3 +1,21 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2015-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 from __future__ import division
 import numpy
 import unittest
@@ -8,6 +26,7 @@ from openquake.qa_tests_data.scenario import (
     case_1, case_2, case_3, case_4, case_5, case_6, case_7, case_8, case_9)
 
 from openquake.commonlib import writers
+from openquake.baselib.general import get_array
 from openquake.calculators.tests import CalculatorTestCase
 
 
@@ -25,27 +44,27 @@ def count_close(gmf_value, gmvs_site_one, gmvs_site_two, delta=0.1):
                for v1, v2 in zip(gmvs_site_one, gmvs_site_two))
 
 
-class ScenarioHazardTestCase(CalculatorTestCase):
+class ScenarioTestCase(CalculatorTestCase):
 
     def frequencies(self, case, fst_value, snd_value):
-        result = self.execute(case.__file__, 'job.ini')
+        [gmfa] = self.execute(case.__file__, 'job.ini').values()
         [imt] = self.calc.oqparam.imtls
-        [gsim] = list(map(str, self.calc.gsims))
-        gmf = numpy.array([result[tag][gsim][imt] for tag in sorted(result)]).T
+        gmvs0 = get_array(gmfa, sid=0, imti=0)['gmv']
+        gmvs1 = get_array(gmfa, sid=1, imti=0)['gmv']
         realizations = float(self.calc.oqparam.number_of_ground_motion_fields)
-        gmvs_within_range_fst = count_close(fst_value, gmf[0], gmf[1])
-        gmvs_within_range_snd = count_close(snd_value, gmf[0], gmf[1])
+        gmvs_within_range_fst = count_close(fst_value, gmvs0, gmvs1)
+        gmvs_within_range_snd = count_close(snd_value, gmvs0, gmvs1)
         return (gmvs_within_range_fst / realizations,
                 gmvs_within_range_snd / realizations)
 
     def medians(self, case):
-        result = self.execute(case.__file__, 'job.ini')
-        [gsim] = list(map(str, self.calc.gsims))
-        median = self.calc.oqparam.imtls.copy()
-        for imt in median:
-            gmfs = numpy.array([result[tag][gsim][imt]  # shape (N, R)
-                                for tag in sorted(result)]).T
-            median[imt] = list(map(numpy.median, gmfs))  # shape N
+        [gmfa] = self.execute(case.__file__, 'job.ini').values()
+        median = {imt: [] for imt in self.calc.oqparam.imtls}
+        for imti, imt in enumerate(self.calc.oqparam.imtls):
+            gmfa_by_imt = get_array(gmfa, imti=imti)
+            for sid in self.calc.sitecol.sids:
+                gmvs = get_array(gmfa_by_imt, sid=sid)['gmv']
+                median[imt].append(numpy.median(gmvs))
         return median
 
     @attr('qa', 'hazard', 'scenario')
@@ -65,15 +84,15 @@ class ScenarioHazardTestCase(CalculatorTestCase):
         with writers.floatformat('%5.1E'):
             out = self.run_calc(case_1.__file__, 'job.ini', exports='xml')
         raise unittest.SkipTest  # because of the rounding errors
-        self.assertEqualFiles('expected.xml', out['gmfs', 'xml'][0])
+        self.assertEqualFiles('expected.xml', out['gmf_data', 'xml'][0])
 
     @attr('qa', 'hazard', 'scenario')
     def test_case_1bis(self):
         # 2 out of 3 sites were filtered out
         out = self.run_calc(case_1.__file__, 'job.ini',
-                            maximum_distance=0.1, exports='csv')
+                            maximum_distance='0.1', exports='txt')
         self.assertEqualFiles(
-            'BooreAtkinson2008_gmf.csv', out['gmfs', 'csv'][0])
+            'BooreAtkinson2008_gmf.txt', out['gmf_data', 'txt'][0])
 
     @attr('qa', 'hazard', 'scenario')
     def test_case_2(self):
@@ -124,11 +143,15 @@ class ScenarioHazardTestCase(CalculatorTestCase):
     def test_case_9(self):
         with writers.floatformat('%10.6E'):
             out = self.run_calc(case_9.__file__, 'job.ini', exports='xml')
-        f1, f2 = out['gmfs', 'xml']
+        f1, f2 = out['gmf_data', 'xml']
         self.assertEqualFiles('LinLee2008SSlab_gmf.xml', f1)
         self.assertEqualFiles('YoungsEtAl1997SSlab_gmf.xml', f2)
 
-        out = self.run_calc(case_9.__file__, 'job.ini', exports='csv')
-        f1, f2 = out['gmfs', 'csv']
-        self.assertEqualFiles('LinLee2008SSlab_gmf.csv', f1)
-        self.assertEqualFiles('YoungsEtAl1997SSlab_gmf.csv', f2)
+        out = self.run_calc(case_9.__file__, 'job.ini', exports='txt,csv')
+        f1, f2 = out['gmf_data', 'txt']
+        self.assertEqualFiles('LinLee2008SSlab_gmf.txt', f1)
+        self.assertEqualFiles('YoungsEtAl1997SSlab_gmf.txt', f2)
+
+        f1, f2 = out['gmf_data', 'csv']
+        self.assertEqualFiles('gmf-LinLee2008SSlab-PGA.csv', f1)
+        self.assertEqualFiles('gmf-YoungsEtAl1997SSlab-PGA.csv', f2)

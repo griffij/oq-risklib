@@ -1,23 +1,21 @@
-#  -*- coding: utf-8 -*-
-#  vim: tabstop=4 shiftwidth=4 softtabstop=4
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-#  Copyright (c) 2014-2015, GEM Foundation
-
-#  OpenQuake is free software: you can redistribute it and/or modify it
-#  under the terms of the GNU Affero General Public License as published
-#  by the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-
-#  OpenQuake is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-
-#  You should have received a copy of the GNU Affero General Public License
-#  along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
-
-import os
-import logging
 import itertools
 import numpy
 
@@ -25,6 +23,7 @@ from openquake.commonlib import parallel, riskmodels
 from openquake.risklib import scientific
 from openquake.calculators import base
 
+F32 = numpy.float32
 F64 = numpy.float64
 
 
@@ -75,18 +74,18 @@ def dist_total(data, multi_stat_dt):
 
 
 @parallel.litetask
-def scenario_damage(riskinputs, riskmodel, rlzs_assoc, monitor):
+def scenario_damage(riskinput, riskmodel, rlzs_assoc, monitor):
     """
     Core function for a damage computation.
 
-    :param riskinputs:
-        a list of :class:`openquake.risklib.riskinput.RiskInput` objects
+    :param riskinput:
+        a :class:`openquake.risklib.riskinput.RiskInput` object
     :param riskmodel:
-        a :class:`openquake.risklib.riskinput.RiskModel` instance
+        a :class:`openquake.risklib.riskinput.CompositeRiskModel` instance
     :param rlzs_assoc:
         a class:`openquake.commonlib.source.RlzsAssoc` instance
     :param monitor:
-        :class:`openquake.baselib.performance.PerformanceMonitor` instance
+        :class:`openquake.baselib.performance.Monitor` instance
     :returns:
         a dictionary {'d_asset': [(l, r, a, mean-stddev), ...],
                       'd_taxonomy': damage array of shape T, L, R, E, D,
@@ -98,9 +97,6 @@ def scenario_damage(riskinputs, riskmodel, rlzs_assoc, monitor):
     If there is no consequence model `c_asset` is an empty list and
     `c_taxonomy` is a zero-value array.
     """
-    logging.info('Process %d, considering %d risk input(s) of weight %d',
-                 os.getpid(), len(riskinputs),
-                 sum(ri.weight for ri in riskinputs))
     c_models = monitor.consequence_models
     L = len(riskmodel.loss_types)
     R = len(rlzs_assoc.realizations)
@@ -108,14 +104,11 @@ def scenario_damage(riskinputs, riskmodel, rlzs_assoc, monitor):
     E = monitor.oqparam.number_of_ground_motion_fields
     T = len(monitor.taxonomies)
     taxo2idx = {taxo: i for i, taxo in enumerate(monitor.taxonomies)}
-    lt2idx = {lt: i for i, lt in enumerate(riskmodel.loss_types)}
     result = dict(d_asset=[], d_taxon=numpy.zeros((T, L, R, E, D), F64),
                   c_asset=[], c_taxon=numpy.zeros((T, L, R, E), F64))
-    for out_by_rlz in riskmodel.gen_outputs(
-            riskinputs, rlzs_assoc, monitor):
-        for out in out_by_rlz:
-            l = lt2idx[out.loss_type]
-            r = out.hid
+    for out_by_lr in riskmodel.gen_outputs(
+            riskinput, rlzs_assoc, monitor):
+        for (l, r), out in sorted(out_by_lr.items()):
             c_model = c_models.get(out.loss_type)
             for asset, fraction in zip(out.assets, out.damages):
                 t = taxo2idx[asset.taxonomy]
@@ -126,11 +119,12 @@ def scenario_damage(riskinputs, riskmodel, rlzs_assoc, monitor):
                     c_ratio = numpy.dot(fraction, [0] + means)
                     consequences = c_ratio * asset.value(out.loss_type)
                     result['c_asset'].append(
-                        (l, r, asset.idx, scientific.mean_std(consequences)))
+                        (l, r, asset.ordinal,
+                         scientific.mean_std(consequences)))
                     result['c_taxon'][t, l, r, :] += consequences
                     # TODO: consequences for the occupants
                 result['d_asset'].append(
-                    (l, r, asset.idx, scientific.mean_std(damages)))
+                    (l, r, asset.ordinal, scientific.mean_std(damages)))
                 result['d_taxon'][t, l, r, :] += damages
     return result
 
@@ -141,7 +135,7 @@ class ScenarioDamageCalculator(base.RiskCalculator):
     Scenario damage calculator
     """
     pre_calculator = 'scenario'
-    core_func = scenario_damage
+    core_task = scenario_damage
     is_stochastic = True
 
     def pre_execute(self):
@@ -150,7 +144,7 @@ class ScenarioDamageCalculator(base.RiskCalculator):
         base.RiskCalculator.pre_execute(self)
         self.monitor.consequence_models = riskmodels.get_risk_models(
             self.oqparam, 'consequence')
-        _, gmfs = base.get_gmfs(self)
+        self.etags, gmfs = base.get_gmfs(self.datastore)
         self.riskinputs = self.build_riskinputs(gmfs)
         self.monitor.taxonomies = sorted(self.taxonomies)
 
@@ -169,10 +163,10 @@ class ScenarioDamageCalculator(base.RiskCalculator):
         # damage distributions
         dt_list = []
         for ltype in ltypes:
-            dt_list.append((ltype, numpy.dtype([('mean', (F64, D)),
-                                                ('stddev', (F64, D))])))
+            dt_list.append((ltype, numpy.dtype([('mean', (F32, D)),
+                                                ('stddev', (F32, D))])))
         multi_stat_dt = numpy.dtype(dt_list)
-        d_asset = numpy.zeros((N, L, R, 2, D), F64)
+        d_asset = numpy.zeros((N, L, R, 2, D), F32)
         for (l, r, a, stat) in result['d_asset']:
             d_asset[a, l, r] = stat
         self.datastore['dmg_by_asset'] = dist_by_asset(
@@ -184,11 +178,11 @@ class ScenarioDamageCalculator(base.RiskCalculator):
 
         # consequence distributions
         if result['c_asset']:
-            c_asset = numpy.zeros((N, L, R, 2), F64)
+            c_asset = numpy.zeros((N, L, R, 2), F32)
             for (l, r, a, stat) in result['c_asset']:
                 c_asset[a, l, r] = stat
             multi_stat_dt = numpy.dtype(
-                [(lt, [('mean', F64), ('stddev', F64)]) for lt in ltypes])
+                [(lt, [('mean', F32), ('stddev', F32)]) for lt in ltypes])
             self.datastore['csq_by_asset'] = dist_by_asset(
                 c_asset, multi_stat_dt)
             self.datastore['csq_by_taxon'] = dist_by_taxon(

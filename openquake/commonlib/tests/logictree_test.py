@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-
-# Copyright (c) 2010-2014, GEM Foundation.
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2010-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -10,10 +11,10 @@
 # OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 """
 Tests for python logic tree processor.
@@ -70,7 +71,7 @@ class _TestableSourceModelLogicTree(logictree.SourceModelLogicTree):
 def _make_nrml(content):
     return (u"""\
     <nrml xmlns:gml="http://www.opengis.net/gml"\
-          xmlns="http://openquake.org/xmlns/nrml/0.4">\
+          xmlns="http://openquake.org/xmlns/nrml/0.5">\
         %s
     </nrml>""" % content).encode('utf8')
 
@@ -193,7 +194,7 @@ class SourceModelLogicTreeBrokenInputTestCase(unittest.TestCase):
             'screwed_schema', {'screwed_schema': source}, 'base',
             logictree.ParsingError
         )
-        error = "'{http://openquake.org/xmlns/nrml/0.4}logicTreeSet': " \
+        error = "'{http://openquake.org/xmlns/nrml/0.5}logicTreeSet': " \
                 "This element is not expected."
         self.assertTrue(error in str(exc),
                         "wrong exception message: %s" % exc.message)
@@ -2336,13 +2337,13 @@ class GsimLogicTreeTestCase(unittest.TestCase):
         gsim_lt = self.parse_valid(xml, ["Stable Shallow Crust"])
         [rlz] = gsim_lt
         gsim = gsim_lt.get_gsim_by_trt(rlz, 'Stable Shallow Crust')
-        self.assertEqual(str(gsim), 'AkkarBommer2010')
+        self.assertEqual(str(gsim), 'AkkarBommer2010()')
         # this test was broken in release 1.4, a wrong ordering
         # of the value gave back LinLee2008SSlab instead of AkkarBommer2010
         self.assertEqual(map(str, rlz.value), [
-            'AkkarBommer2010', 'AkkarBommer2010', 'ToroEtAl2002SHARE',
-            'ZhaoEtAl2006SInter', 'ZhaoEtAl2006SSlab', 'FaccioliEtAl2010',
-            'LinLee2008SSlab'])
+            'AkkarBommer2010()', 'AkkarBommer2010()', 'ToroEtAl2002SHARE()',
+            'ZhaoEtAl2006SInter()', 'ZhaoEtAl2006SSlab()',
+            'FaccioliEtAl2010()', 'LinLee2008SSlab()'])
 
     def test_gsim_with_kwargs(self):
         class FakeGMPETable(object):
@@ -2371,7 +2372,7 @@ class GsimLogicTreeTestCase(unittest.TestCase):
             </logicTree>
             """)
             gsim_lt = self.parse_valid(xml, ['Shield'])
-            self.assertEqual(str(gsim_lt), '''<GsimLogicTree
+            self.assertEqual(repr(gsim_lt), '''<GsimLogicTree
 Shield,b1,FakeGMPETable(gmpe_table="Wcrust_rjb_med.hdf5"),w=1.0>''')
         finally:
             del valid.GSIM['FakeGMPETable']
@@ -2405,7 +2406,7 @@ class LogicTreeProcessorTestCase(unittest.TestCase):
     def test_sample_gmpe(self):
         (value, weight, branch_ids, _, _) = logictree.sample_one(
             self.gmpe_lt, self.rnd)
-        self.assertEqual(value, ('ChiouYoungs2008', 'SadighEtAl1997'))
+        self.assertEqual(value, ('ChiouYoungs2008()', 'SadighEtAl1997()'))
         self.assertEqual(weight, 0.5)
         self.assertEqual(('b2', 'b3'), branch_ids)
 

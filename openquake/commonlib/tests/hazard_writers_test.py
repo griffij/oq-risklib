@@ -1,4 +1,7 @@
-# Copyright (c) 2012-2014, GEM Foundation.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2012-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -8,10 +11,10 @@
 # OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import sys
 import json
@@ -40,7 +43,7 @@ def setUpModule():
 
 
 def tearDownModule():
-    if sys.exc_info()[0] is None:  # remove TMP
+    if sys.exc_info()[0] is None and os.path.exists(path):  # remove TMP
         os.remove(path)
 
 
@@ -113,13 +116,13 @@ class ProbabilisticRupture(object):
         self.bottom_left_corner = bottom_left_corner
 
 
-class SESRupture(object):
+class EBRupture(object):
 
-    def __init__(self, rupture, ses, seed=0, tag="TAG"):
+    def __init__(self, rupture, ses, seed=0, etag="TAG"):
         self.rupture = rupture
         self.ses = ses
         self.seed = seed
-        self.tag = tag
+        self.etag = etag
 
 
 class HazardWriterTestCase(unittest.TestCase):
@@ -435,77 +438,6 @@ class EventBasedGMFXMLWriterTestCase(HazardWriterTestCase):
             path, sm_lt_path, gsim_lt_path)
         writer.serialize(gmf_collection)
         check_equal(__file__, 'expected_gmf.xml', path)
-
-
-class SESXMLWriterTestCase(HazardWriterTestCase):
-
-    def test_serialize(self):
-        pr1 = ProbabilisticRupture(
-            1,
-            5.5, 1.0, 40.0, 10.0, 'Active Shallow Crust',
-            False, False,
-            top_left_corner=(1.1, 1.01, 10.0),
-            top_right_corner=(2.1, 2.01, 20.0),
-            bottom_right_corner=(3.1, 3.01, 30.0),
-            bottom_left_corner=(4.1, 4.01, 40.0))
-
-        pr2 = ProbabilisticRupture(
-            2,
-            6.5, 0.0, 41.0, 0.0, 'Active Shallow Crust',
-            True, False,
-            lons=[[5.1, 6.1],
-                  [7.1, 8.1],
-                  ],
-            lats=[[5.01, 6.01],
-                  [7.01, 8.01],
-                  ],
-            depths=[[10.5, 10.6],
-                    [10.7, 10.8],
-                    ])
-        ses1 = SES(1, 50.0, [SESRupture(pr1, 1), SESRupture(pr2, 1)])
-
-        pr3 = ProbabilisticRupture(
-            3,
-            5.4, 2.0, 42.0, 12.0, 'Stable Shallow Crust',
-            False, False,
-            top_left_corner=(1.1, 1.01, 10.0),
-            top_right_corner=(2.1, 2.01, 20.0),
-            bottom_left_corner=(4.1, 4.01, 40.0),
-            bottom_right_corner=(3.1, 3.01, 30.0))
-
-        pr4 = ProbabilisticRupture(
-            4,
-            6.4, 3.0, 43.0, 13.0, 'Stable Shallow Crust',
-            True, False,
-            lons=[
-                [5.2, 6.2],
-                [7.2, 8.2],
-                ],
-            lats=[
-                [5.02, 6.02],
-                [7.02, 8.02],
-                ],
-            depths=[
-                [10.1, 10.2],
-                [10.3, 10.4],
-                ])
-
-        pr5 = ProbabilisticRupture(
-            5,
-            7.4, 4.0, 44.0, 14.0, 'Stable Shallow Crust',
-            False, True,
-            lons=[-1.0, 1.0, -1.0, 1.0, 0.0, 1.1, 0.9, 2.0],
-            lats=[1.0, 1.0, -1.0, -1.0, 1.1, 2.0, 0.0, 0.9],
-            depths=[21.0, 21.0, 59.0, 59.0, 20.0, 20.0, 80.0, 80.0])
-
-        ses2 = SES(2, 40.0, [SESRupture(pr3, 1), SESRupture(pr4, 1),
-                             SESRupture(pr5, 1)])
-
-        sm_lt_path = 'b8_b9_b10'
-
-        writer = writers.SESXMLWriter(path, sm_lt_path)
-        writer.serialize([ses1, ses2])
-        check_equal(__file__, 'expected_ses_collection.xml', path)
 
 
 class HazardMapWriterTestCase(HazardWriterTestCase):

@@ -1,25 +1,27 @@
 Event-Based Hazard QA Test, Case 2
 ==================================
 
-num_sites = 1
+gem-tstation:/home/michele/ssd/calc_19681.hdf5 updated Wed May 25 08:34:18 2016
+
+num_sites = 1, sitecol = 739 B
 
 Parameters
 ----------
-============================ ===========
-calculation_mode             event_based
-number_of_logic_tree_samples 0          
-maximum_distance             200.0      
-investigation_time           1.0        
-ses_per_logic_tree_path      350        
-truncation_level             0.0        
-rupture_mesh_spacing         1.0        
-complex_fault_mesh_spacing   1.0        
-width_of_mfd_bin             0.001      
-area_source_discretization   10.0       
-random_seed                  1066       
-master_seed                  0          
-concurrent_tasks             32         
-============================ ===========
+============================ ===================
+calculation_mode             'event_based'      
+number_of_logic_tree_samples 0                  
+maximum_distance             {'default': 200.0} 
+investigation_time           1.0                
+ses_per_logic_tree_path      600                
+truncation_level             0.0                
+rupture_mesh_spacing         1.0                
+complex_fault_mesh_spacing   1.0                
+width_of_mfd_bin             0.001              
+area_source_discretization   10.0               
+random_seed                  1066               
+master_seed                  0                  
+oqlite_version               '0.13.0-git1cc9966'
+============================ ===================
 
 Input files
 -----------
@@ -34,47 +36,95 @@ source_model_logic_tree `source_model_logic_tree.xml <source_model_logic_tree.xm
 
 Composite source model
 ----------------------
-========= ====== ====================================== =============== ================ ===========
-smlt_path weight source_model_file                      gsim_logic_tree num_realizations num_sources
-========= ====== ====================================== =============== ================ ===========
-b1        1.00   `source_model.xml <source_model.xml>`_ trivial(1)      1/1              1          
-========= ====== ====================================== =============== ================ ===========
+========= ====== ====================================== =============== ================
+smlt_path weight source_model_file                      gsim_logic_tree num_realizations
+========= ====== ====================================== =============== ================
+b1        1.000  `source_model.xml <source_model.xml>`_ trivial(1)      1/1             
+========= ====== ====================================== =============== ================
 
 Required parameters per tectonic region type
 --------------------------------------------
-====== ============== ========= ========== ==========
-trt_id gsims          distances siteparams ruptparams
-====== ============== ========= ========== ==========
-0      SadighEtAl1997 rrup      vs30       rake mag  
-====== ============== ========= ========== ==========
+====== ================ ========= ========== ==========
+trt_id gsims            distances siteparams ruptparams
+====== ================ ========= ========== ==========
+0      SadighEtAl1997() rrup      vs30       rake mag  
+====== ================ ========= ========== ==========
 
 Realizations per (TRT, GSIM)
 ----------------------------
 
 ::
 
-  <RlzsAssoc(1)
-  0,SadighEtAl1997: ['<0,b1,b1,w=1.0>']>
+  <RlzsAssoc(size=1, rlzs=1)
+  0,SadighEtAl1997(): ['<0,b1,b1,w=1.0>']>
 
-Non-empty rupture collections
------------------------------
-=== ========= ==================== ============
-col smlt_path TRT                  num_ruptures
-=== ========= ==================== ============
-0   b1        active shallow crust 3           
-=== ========= ==================== ============
+Number of ruptures per tectonic region type
+-------------------------------------------
+================ ====== ==================== =========== ============ ======
+source_model     trt_id trt                  num_sources eff_ruptures weight
+================ ====== ==================== =========== ============ ======
+source_model.xml 0      Active Shallow Crust 1           3            75    
+================ ====== ==================== =========== ============ ======
 
-Collections <-> realizations
-----------------------------
-=========== ============
-Collections Realizations
-0           0           
-=========== ============
+Informational data
+------------------
+======== ==============
+hostname 'gem-tstation'
+======== ==============
 
-Expected data transfer for the sources
---------------------------------------
-================================== =======
-Number of tasks to generate        1      
-Estimated sources to send          1.88 KB
-Estimated hazard curves to receive 32 B   
-================================== =======
+Specific information for event based
+------------------------------------
+======================== =====
+Total number of ruptures 3    
+Total number of events   3    
+Rupture multiplicity     1.000
+======================== =====
+
+Slowest sources
+---------------
+============ ========= ============ ====== ========= =========== ========== =========
+trt_model_id source_id source_class weight split_num filter_time split_time calc_time
+============ ========= ============ ====== ========= =========== ========== =========
+0            1         PointSource  75     1         0.004       1.597E-05  2.127    
+============ ========= ============ ====== ========= =========== ========== =========
+
+Computation times by source typology
+------------------------------------
+============ =========== ========== ========= ======
+source_class filter_time split_time calc_time counts
+============ =========== ========== ========= ======
+PointSource  0.004       1.597E-05  2.127     1     
+============ =========== ========== ========= ======
+
+Information about the tasks
+---------------------------
+================================= ===== ========= ===== ===== =========
+measurement                       mean  stddev    min   max   num_tasks
+compute_ruptures.time_sec         2.127 NaN       2.127 2.127 1        
+compute_ruptures.memory_mb        -0.25 NaN       -0.25 -0.25 1        
+compute_gmfs_and_curves.time_sec  0.002 3.994E-05 0.002 0.002 3        
+compute_gmfs_and_curves.memory_mb 0.0   0.0       0.0   0.0   3        
+================================= ===== ========= ===== ===== =========
+
+Slowest operations
+------------------
+============================== ========= ========= ======
+operation                      time_sec  memory_mb counts
+============================== ========= ========= ======
+total compute_ruptures         2.127     0.0       1     
+store source_info              0.011     0.0       1     
+reading composite source model 0.007     0.0       1     
+total compute_gmfs_and_curves  0.007     0.0       3     
+managing sources               0.006     0.0       1     
+saving ruptures                0.005     0.0       1     
+filtering sources              0.004     0.0       1     
+make contexts                  0.003     0.0       3     
+aggregating hcurves            0.003     0.0       3     
+saving gmfs                    0.002     0.0       3     
+aggregate curves               0.002     0.0       4     
+bulding hazard curves          7.710E-04 0.0       3     
+compute poes                   7.553E-04 0.0       3     
+filtering ruptures             6.592E-04 0.0       3     
+reading site collection        2.718E-05 0.0       1     
+splitting sources              1.597E-05 0.0       1     
+============================== ========= ========= ======

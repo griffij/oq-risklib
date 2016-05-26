@@ -1,17 +1,20 @@
-# Copyright (c) 2010-2014, GEM Foundation.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
 #
-# NRML is free software: you can redistribute it and/or modify it
+# Copyright (C) 2010-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
 # by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# NRML is distributed in the hope that it will be useful,
+# OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with NRML.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import io
 import types
@@ -23,6 +26,9 @@ from xml.sax.saxutils import escape, quoteattr
 import numpy  # this is needed by the doctests, don't remove it
 
 from openquake.baselib.python3compat import unicode
+from openquake.commonlib import InvalidFile
+
+FIVEDIGITS = '%.5E'
 
 
 @contextmanager
@@ -194,6 +200,39 @@ def tostring(node, indent=4, nsmap=None):
     return out.getvalue()
 
 
+class HeaderTranslator(object):
+    """
+    An utility to convert the headers in CSV files. When reading,
+    the column names are converted into column descriptions with the
+    method .read, when writing column descriptions are converted
+    into column names with the method .write. The usage is
+
+    >>> htranslator = HeaderTranslator(
+    ...     asset_ref='asset_ref:|S20',
+    ...     rup_id='rup_id:uint32',
+    ...     taxonomy='taxonomy:|S100')
+    >>> htranslator.read('asset_ref value:5'.split())
+    ['asset_ref:|S20', 'value:5']
+    >>> htranslator.write('asset_ref:|S20 value:5'.split())
+    ['asset_ref', 'value:5']
+    """
+    def __init__(self, **descr):
+        self.descr = descr
+        self.name = {d: n for n, d in descr.items()}
+
+    def read(self, names):
+        return [self.descr.get(n, n) for n in names]
+
+    def write(self, descr):
+        return [self.name.get(d, d) for d in descr]
+
+htranslator = HeaderTranslator(
+    asset_ref='asset_ref:|S20',
+    rup_id='rup_id:uint32',
+    taxonomy='taxonomy:|S100',
+)
+
+
 # recursive function used internally by build_header
 def _build_header(dtype, root):
     header = []
@@ -211,6 +250,7 @@ def _build_header(dtype, root):
     return header
 
 
+# NB: builds an header that can be read by parse_header
 def build_header(dtype):
     """
     Convert a numpy nested dtype into a list of strings suitable as header
@@ -222,7 +262,7 @@ def build_header(dtype):
     >>> gmf_dt = numpy.dtype([('A', imt_dt), ('B', imt_dt),
     ...                       ('idx', numpy.uint32)])
     >>> build_header(gmf_dt)
-    ['A-PGA:float64:3', 'A-PGV:float64:4', 'B-PGA:float64:3', 'B-PGV:float64:4', 'idx:uint32:']
+    ['A-PGA:float64:3', 'A-PGV:float64:4', 'B-PGA:float64:3', 'B-PGV:float64:4', 'idx:uint32']
     """
     header = _build_header(dtype, ())
     h = []
@@ -230,7 +270,12 @@ def build_header(dtype):
         name = '-'.join(col[:-2])
         numpytype = col[-2]
         shape = col[-1]
-        h.append(':'.join([name, numpytype, ':'.join(map(str, shape))]))
+        coldescr = name
+        if numpytype != 'float32':
+            coldescr += ':' + numpytype
+        if shape:
+            coldescr += ':' + ':'.join(map(str, shape))
+        h.append(coldescr)
     return h
 
 
@@ -257,7 +302,7 @@ def extract_from(data, fields):
     return data
 
 
-def write_csv(dest, data, sep=',', fmt='%12.8E', header=None):
+def write_csv(dest, data, sep=',', fmt='%.6E', header=None):
     """
     :param dest: destination filename or io.StringIO instance
     :param data: array to save
@@ -267,8 +312,7 @@ def write_csv(dest, data, sep=',', fmt='%12.8E', header=None):
        optional list with the names of the columns to display
     """
     if len(data) == 0:
-        logging.warn('Not generating %s, it would be empty', dest)
-        return dest
+        logging.warn('%s is empty', dest)
     if not hasattr(dest, 'getvalue'):
         # not a StringIO, assume dest is a filename
         dest = open(dest, 'w')
@@ -283,7 +327,7 @@ def write_csv(dest, data, sep=',', fmt='%12.8E', header=None):
 
     someheader = header or autoheader
     if someheader:
-        dest.write(sep.join(someheader) + u'\n')
+        dest.write(sep.join(htranslator.write(someheader)) + u'\n')
 
     if autoheader:
         all_fields = [col.split(':', 1)[0].split('-')
@@ -303,6 +347,151 @@ def write_csv(dest, data, sep=',', fmt='%12.8E', header=None):
     else:
         dest.close()
     return dest.name
+
+
+class CsvWriter(object):
+    """
+    Class used in the exporters to save a bunch of CSV files
+    """
+    def __init__(self, sep=',', fmt='%12.8E'):
+        self.sep = sep
+        self.fmt = fmt
+        self.fnames = []
+
+    def save(self, data, fname, header=None):
+        """
+        Save data on fname.
+
+        :param data: numpy array or list of lists
+        :param fname: path name
+        :param header: header to use
+        """
+        write_csv(fname, data, self.sep, self.fmt, header)
+        self.fnames.append(fname)
+
+    def getsaved(self):
+        """
+        Returns the list of files saved by this CsvWriter
+        """
+        return sorted(self.fnames)
+
+
+def castable_to_int(s):
+    """
+    Return True if the string `s` can be interpreted as an integer
+    """
+    try:
+        int(s)
+    except ValueError:
+        return False
+    else:
+        return True
+
+
+def parse_header(header):
+    """
+    Convert a list of the form `['fieldname:fieldtype:fieldsize',...]`
+    into a numpy composite dtype. The parser understands headers generated
+    by :func:`openquake.commonlib.writers.build_header`.
+    Here is an example:
+
+    >>> parse_header(['PGA', 'PGV:float64', 'avg:2'])
+    (['PGA', 'PGV', 'avg'], dtype([('PGA', '<f4'), ('PGV', '<f8'), ('avg', '<f4', (2,))]))
+
+    :params header: a list of type descriptions
+    :returns: column names and the corresponding composite dtype
+    """
+    triples = []
+    fields = []
+    for col_str in header:
+        col = col_str.split(':')
+        n = len(col)
+        if n == 1:  # default dtype and no shape
+            col = [col[0], 'float32', '']
+        elif n == 2:
+            if castable_to_int(col[1]):  # default dtype and shape
+                col = [col[0], 'float32', col[1]]
+            else:  # dtype and no shape
+                col = [col[0], col[1], '']
+        elif n > 3:
+            raise ValueError('Invalid column description: %s' % col_str)
+        field = col[0]
+        numpytype = col[1]
+        shape = () if not col[2].strip() else (int(col[2]),)
+        triples.append((field, numpytype, shape))
+        fields.append(field)
+    return fields, numpy.dtype(triples)
+
+
+def _cast(col, ntype, shape, lineno, fname):
+    # convert strings into tuples or numbers, used inside read_composite_array
+    if shape:
+        return tuple(map(ntype, col.split()))
+    else:
+        return ntype(col)
+
+
+# NB: this only works with flat composite arrays
+def read_composite_array(fname, sep=','):
+    r"""
+    Convert a CSV file with header into a numpy array of records.
+
+    >>> from openquake.baselib.general import writetmp
+    >>> fname = writetmp('PGA:float64:3,PGV:float64:2,avg:float64:1\n'
+    ...                  '.1 .2 .3,.4 .5,.6\n')
+    >>> print read_composite_array(fname)  # array of shape (1,)
+    [([0.1, 0.2, 0.3], [0.4, 0.5], [0.6])]
+    """
+    with open(fname) as f:
+        header = next(f)
+        fields, dtype = parse_header(htranslator.read(header.split(sep)))
+        ts_pairs = []  # [(type, shape), ...]
+        for name in fields:
+            dt = dtype.fields[name][0]
+            ts_pairs.append((dt.subdtype[0].type if dt.subdtype else dt.type,
+                             dt.shape))
+        col_ids = list(range(1, len(ts_pairs) + 1))
+        num_columns = len(col_ids)
+        records = []
+        col, col_id = '', 0
+        for i, line in enumerate(f, 2):
+            row = line.split(sep)
+            if len(row) != num_columns:
+                raise InvalidFile(
+                    'expected %d columns, found %d in file %s, line %d' %
+                    (num_columns, len(row), fname, i))
+            try:
+                record = []
+                for (ntype, shape), col, col_id in zip(ts_pairs, row, col_ids):
+                    record.append(_cast(col, ntype, shape, i, fname))
+                records.append(tuple(record))
+            except Exception as e:
+                raise InvalidFile(
+                    'Could not cast %r in file %s, line %d, column %d '
+                    'using %s: %s' % (col, fname, i, col_id,
+                                      (ntype.__name__,) + shape, e))
+        return numpy.array(records, dtype)
+
+
+# this is simple and without error checking for the moment
+def read_array(fname, sep=','):
+    r"""
+    Convert a CSV file without header into a numpy array of floats.
+
+    >>> from openquake.baselib.general import writetmp
+    >>> print read_array(writetmp('.1 .2, .3 .4, .5 .6\n'))
+    [[[ 0.1  0.2]
+      [ 0.3  0.4]
+      [ 0.5  0.6]]]
+    """
+    with open(fname) as f:
+        records = []
+        for line in f:
+            row = line.split(sep)
+            record = [list(map(float, col.split())) for col in row]
+            records.append(record)
+        return numpy.array(records)
+
 
 if __name__ == '__main__':  # pretty print of NRML files
     import sys

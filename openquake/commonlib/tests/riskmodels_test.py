@@ -1,4 +1,7 @@
-# Copyright (c) 2014-2015, GEM Foundation.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -8,10 +11,10 @@
 # OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import pickle
@@ -27,7 +30,7 @@ EXAMPLES_DIR = os.path.dirname(nrml_examples.__file__)
 FF_DIR = os.path.dirname(case_4b.__file__)
 
 
-class ParseRiskModelTestCase(unittest.TestCase):
+class ParseCompositeRiskModelTestCase(unittest.TestCase):
 
     def test_different_levels_ok(self):
         # the same IMT can appear with different levels in different
@@ -39,7 +42,7 @@ class ParseRiskModelTestCase(unittest.TestCase):
     <vulnerabilityModel>
         <discreteVulnerabilitySet vulnerabilitySetID="PAGER"
                                   assetCategory="population"
-                                  lossCategory="fatalities">
+                                  lossCategory="occupants">
             <IML IMT="PGA">0.005 0.007 0.0098 0.0137</IML>
             <discreteVulnerability vulnerabilityFunctionID="RC/A"
                                    probabilisticDistribution="LN">
@@ -50,7 +53,7 @@ class ParseRiskModelTestCase(unittest.TestCase):
         </discreteVulnerabilitySet>
         <discreteVulnerabilitySet vulnerabilitySetID="PAGER"
                                   assetCategory="population"
-                                  lossCategory="fatalities">
+                                  lossCategory="occupants">
             <IML IMT="PGA">0.004 0.008 0.037</IML>
             <discreteVulnerability vulnerabilityFunctionID="RC/B"
                                    probabilisticDistribution="LN">
@@ -80,7 +83,7 @@ class ParseRiskModelTestCase(unittest.TestCase):
     <vulnerabilityModel>
         <discreteVulnerabilitySet vulnerabilitySetID="PAGER"
                                   assetCategory="population"
-                                  lossCategory="fatalities">
+                                  lossCategory="occupants">
             <IML IMT="PGA">0.005 0.007 0.0098 0.0137</IML>
             <discreteVulnerability vulnerabilityFunctionID="A"
                                    probabilisticDistribution="LN">
@@ -91,7 +94,7 @@ class ParseRiskModelTestCase(unittest.TestCase):
         </discreteVulnerabilitySet>
         <discreteVulnerabilitySet vulnerabilitySetID="PAGER"
                                   assetCategory="population"
-                                  lossCategory="fatalities">
+                                  lossCategory="occupants">
             <IML IMT="MMI">0.005 0.007 0.0098 0.0137</IML>
             <discreteVulnerability vulnerabilityFunctionID="A"
                                    probabilisticDistribution="LN">
@@ -118,7 +121,7 @@ class ParseRiskModelTestCase(unittest.TestCase):
     <vulnerabilityModel>
         <discreteVulnerabilitySet vulnerabilitySetID="PAGER"
                                   assetCategory="population"
-                                  lossCategory="fatalities">
+                                  lossCategory="occupants">
             <IML IMT="PGV">0.005 0.007 0.0098 0.0137</IML>
             <discreteVulnerability vulnerabilityFunctionID="A"
                                    probabilisticDistribution="LN">

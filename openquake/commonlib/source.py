@@ -1,5 +1,7 @@
-from __future__ import division
-# Copyright (c) 2010-2015, GEM Foundation.
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2010-2016 GEM Foundation
 #
 # OpenQuake is free software: you can redistribute it and/or modify it
 # under the terms of the GNU Affero General Public License as published
@@ -9,27 +11,37 @@ from __future__ import division
 # OpenQuake is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
 # You should have received a copy of the GNU Affero General Public License
-# along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
 
-import mock
-import time
+from __future__ import division
+import sys
+import copy
+import math
 import logging
 import operator
-import itertools
 import collections
 import random
 from xml.etree import ElementTree as etree
 
 import numpy
 
-from openquake.baselib.general import AccumDict, groupby
+from openquake.baselib.python3compat import raise_
+from openquake.baselib.general import (
+    AccumDict, groupby, block_splitter, group_array)
+from openquake.hazardlib.site import Tile
+from openquake.hazardlib.probability_map import ProbabilityMap
 from openquake.commonlib.node import read_nodes
-from openquake.commonlib import valid, logictree, sourceconverter, parallel
+from openquake.commonlib import logictree, sourceconverter, parallel, valid
 from openquake.commonlib.nrml import nodefactory, PARSE_NS_MAP
-from functools import reduce
+
+MAX_INT = 2 ** 31 - 1
+U16 = numpy.uint16
+U32 = numpy.uint32
+I32 = numpy.int32
+F32 = numpy.float32
 
 
 class DuplicatedID(Exception):
@@ -41,11 +53,12 @@ class LtRealization(object):
     Composite realization build on top of a source model realization and
     a GSIM realization.
     """
-    def __init__(self, ordinal, sm_lt_path, gsim_rlz, weight):
+    def __init__(self, ordinal, sm_lt_path, gsim_rlz, weight, sampleid):
         self.ordinal = ordinal
         self.sm_lt_path = sm_lt_path
         self.gsim_rlz = gsim_rlz
         self.weight = weight
+        self.sampleid = sampleid
 
     def __repr__(self):
         return '<%d,%s,w=%s>' % (self.ordinal, self.uid, self.weight)
@@ -69,35 +82,48 @@ class LtRealization(object):
         return hash(repr(self))
 
 
-def get_skeleton(sm):
+class SourceModel(object):
     """
-    Return a copy of the source model `sm` which is empty, i.e. without
-    sources.
+    A container of TrtModel instances with some additional attributes
+    describing the source model in the logic tree.
     """
-    trt_models = [TrtModel(tm.trt, [], tm.num_ruptures, tm.min_mag,
-                           tm.max_mag, tm.gsims, tm.id)
-                  for tm in sm.trt_models]
-    num_sources = sum(len(tm) for tm in sm.trt_models)
-    return SourceModel(sm.name, sm.weight, sm.path, trt_models, sm.gsim_lt,
-                       sm.ordinal, sm.samples, num_sources)
+    def __init__(self, name, weight, path, trt_models, gsim_lt, ordinal,
+                 samples):
+        self.name = name
+        self.weight = weight
+        self.path = path
+        self.trt_models = trt_models
+        self.gsim_lt = gsim_lt
+        self.ordinal = ordinal
+        self.samples = samples
 
-SourceModel = collections.namedtuple(
-    'SourceModel', 'name weight path trt_models gsim_lt ordinal samples '
-    'num_sources')
+    @property
+    def num_sources(self):
+        return sum(len(tm) for tm in self.trt_models)
+
+    def num_gsim_paths(self, number_of_logic_tree_samples=0):
+        return (self.samples if number_of_logic_tree_samples
+                else self.gsim_lt.get_num_paths())
+
+    def get_skeleton(self):
+        """
+        Return an empty copy of the source model, i.e. without sources,
+        but with the proper attributes for each TrtModel contained within.
+        """
+        trt_models = [TrtModel(tm.trt, [], tm.min_mag, tm.max_mag, tm.id)
+                      for tm in self.trt_models]
+        return self.__class__(self.name, self.weight, self.path, trt_models,
+                              self.gsim_lt, self.ordinal, self.samples)
 
 
-def get_weight(src, point_source_weight=1/40., num_ruptures=None):
+def capitalize(words):
     """
-    :param src: a hazardlib source object
-    :param point_source_weight: default 1/40
-    :param num_ruptures: if None it is recomputed
-    :returns: the weight of the given source
+    Capitalize words separated by spaces.
+
+    >>> capitalize('active shallow crust')
+    'Active Shallow Crust'
     """
-    num_ruptures = num_ruptures or src.count_ruptures()
-    weight = (num_ruptures * point_source_weight
-              if src.__class__.__name__ == 'PointSource'
-              else num_ruptures)
-    return weight
+    return ' '.join(w.capitalize() for w in words.split(' '))
 
 
 class TrtModel(collections.Sequence):
@@ -108,8 +134,6 @@ class TrtModel(collections.Sequence):
         the tectonic region type all the sources belong to
     :param list sources:
         a list of hazardlib source objects
-    :param int num_ruptures:
-        the total number of ruptures generated by the given sources
     :param min_mag:
         the minimum magnitude among the given sources
     :param max_mag:
@@ -120,8 +144,6 @@ class TrtModel(collections.Sequence):
         an optional numeric ID (default None) useful to associate
         the model to a database object
     """
-    POINT_SOURCE_WEIGHT = 1 / 40.
-
     @classmethod
     def collect(cls, sources):
         """
@@ -135,32 +157,28 @@ class TrtModel(collections.Sequence):
                 source_stats_dict[trt] = TrtModel(trt)
             tm = source_stats_dict[trt]
             if not tm.sources:
-
-                # we increate the rupture counter by 1,
-                # to avoid filtering away the TRTModel
-                tm.num_ruptures = 1
-
                 # we append just one source per TRTModel, so that
-                # the memory occupation is insignificand and at
-                # the same time we avoid the RuntimeError
-                # "All sources were filtered away"
+                # the memory occupation is insignificant
                 tm.sources.append(src)
 
         # return TrtModels, ordered by TRT string
         return sorted(source_stats_dict.values())
 
-    def __init__(self, trt, sources=None, num_ruptures=0,
-                 min_mag=None, max_mag=None, gsims=None, id=0):
+    def __init__(self, trt, sources=None,
+                 min_mag=None, max_mag=None, id=0, eff_ruptures=-1):
         self.trt = trt
         self.sources = sources or []
-        self.num_ruptures = num_ruptures
         self.min_mag = min_mag
         self.max_mag = max_mag
-        self.gsims = gsims or []
         self.id = id
         for src in self.sources:
             self.update(src)
         self.source_model = None  # to be set later, in CompositionInfo
+        self.weight = 1
+        self.eff_ruptures = eff_ruptures  # set later nby get_rlzs_assoc
+
+    def tot_ruptures(self):
+        return sum(src.num_ruptures for src in self.sources)
 
     def update(self, src):
         """
@@ -183,9 +201,9 @@ class TrtModel(collections.Sequence):
             self.max_mag = max_mag
 
     def __repr__(self):
-        return '<%s #%d %s, %d source(s), %d rupture(s)>' % (
+        return '<%s #%d %s, %d source(s), %d effective rupture(s)>' % (
             self.__class__.__name__, self.id, self.trt,
-            len(self.sources), self.num_ruptures)
+            len(self.sources), self.eff_ruptures)
 
     def __lt__(self, other):
         """
@@ -209,39 +227,71 @@ class TrtModel(collections.Sequence):
         return len(self.sources)
 
 
-def parse_source_model(fname, converter, apply_uncertainties=lambda src: None):
+class SourceModelParser(object):
     """
-    Parse a NRML source model and return an ordered list of TrtModel
-    instances.
+    A source model parser featuring a cache.
 
-    :param str fname:
-        the full pathname of the source model file
     :param converter:
         :class:`openquake.commonlib.source.SourceConverter` instance
-    :param apply_uncertainties:
-        a function modifying the sources (or do nothing)
     """
-    converter.fname = fname
-    source_stats_dict = {}
-    source_ids = set()
-    src_nodes = read_nodes(fname, lambda elem: 'Source' in elem.tag,
-                           nodefactory['sourceModel'])
-    for no, src_node in enumerate(src_nodes, 1):
-        src = converter.convert_node(src_node)
-        if src.source_id in source_ids:
-            raise DuplicatedID(
-                'The source ID %s is duplicated!' % src.source_id)
-        apply_uncertainties(src)
-        trt = src.tectonic_region_type
-        if trt not in source_stats_dict:
-            source_stats_dict[trt] = TrtModel(trt)
-        source_stats_dict[trt].update(src)
-        source_ids.add(src.source_id)
-        if no % 10000 == 0:  # log every 10,000 sources parsed
-            logging.info('Parsed %d sources from %s', no, fname)
+    def __init__(self, converter):
+        self.converter = converter
+        self.sources = {}  # cache fname -> sources
+        self.fname_hits = collections.Counter()  # fname -> number of calls
 
-    # return ordered TrtModels
-    return sorted(source_stats_dict.values())
+    def parse_trt_models(self, fname, apply_uncertainties=None):
+        """
+        :param fname:
+            the full pathname of the source model file
+        :param apply_uncertainties:
+            a function modifying the sources (or None)
+        """
+        try:
+            sources = self.sources[fname]
+        except KeyError:
+            sources = self.sources[fname] = self.parse_sources(fname)
+        # NB: deepcopy is *essential* here
+        sources = map(copy.deepcopy, sources)
+        for src in sources:
+            if apply_uncertainties:
+                apply_uncertainties(src)
+                src.num_ruptures = src.count_ruptures()
+        self.fname_hits[fname] += 1
+
+        # build ordered TrtModels
+        trts = {}
+        for src in sources:
+            trt = src.tectonic_region_type
+            if trt not in trts:
+                trts[trt] = TrtModel(trt)
+            trts[trt].update(src)
+        return sorted(trts.values())
+
+    def parse_sources(self, fname):
+        """
+        Parse all the sources and return them ordered by tectonic region type.
+        It does not count the ruptures, so it is relatively fast.
+
+        :param fname:
+            the full pathname of the source model file
+        """
+        sources = []
+        source_ids = set()
+        self.converter.fname = fname
+        src_nodes = read_nodes(fname, lambda elem: 'Source' in elem.tag,
+                               nodefactory['sourceModel'])
+        for no, src_node in enumerate(src_nodes, 1):
+            src = self.converter.convert_node(src_node)
+            if src.source_id in source_ids:
+                raise DuplicatedID(
+                    'The source ID %s is duplicated!' % src.source_id)
+            sources.append(src)
+            source_ids.add(src.source_id)
+            if no % 10000 == 0:  # log every 10,000 sources parsed
+                logging.info('Parsed %d sources from %s', no, fname)
+        if no % 10000 != 0:
+            logging.info('Parsed %d sources from %s', no, fname)
+        return sorted(sources, key=operator.attrgetter('tectonic_region_type'))
 
 
 def agg_prob(acc, prob):
@@ -265,140 +315,151 @@ class RlzsAssoc(collections.Mapping):
     region types and 4 + 2 + 2 realizations, there are the following
     associations:
 
-    (0, 'BooreAtkinson2008') ['#0-SM1-BA2008_C2003', '#1-SM1-BA2008_T2002']
-    (0, 'CampbellBozorgnia2008') ['#2-SM1-CB2008_C2003', '#3-SM1-CB2008_T2002']
-    (1, 'Campbell2003') ['#0-SM1-BA2008_C2003', '#2-SM1-CB2008_C2003']
-    (1, 'ToroEtAl2002') ['#1-SM1-BA2008_T2002', '#3-SM1-CB2008_T2002']
-    (2, 'BooreAtkinson2008') ['#4-SM2_a3pt2b0pt8-BA2008']
-    (2, 'CampbellBozorgnia2008') ['#5-SM2_a3pt2b0pt8-CB2008']
-    (3, 'BooreAtkinson2008') ['#6-SM2_a3b1-BA2008']
-    (3, 'CampbellBozorgnia2008') ['#7-SM2_a3b1-CB2008']
+    (0, 'BooreAtkinson2008()') ['#0-SM1-BA2008_C2003', '#1-SM1-BA2008_T2002']
+    (0, 'CampbellBozorgnia2008()') ['#2-SM1-CB2008_C2003', '#3-SM1-CB2008_T2002']
+    (1, 'Campbell2003()') ['#0-SM1-BA2008_C2003', '#2-SM1-CB2008_C2003']
+    (1, 'ToroEtAl2002()') ['#1-SM1-BA2008_T2002', '#3-SM1-CB2008_T2002']
+    (2, 'BooreAtkinson2008()') ['#4-SM2_a3pt2b0pt8-BA2008']
+    (2, 'CampbellBozorgnia2008()') ['#5-SM2_a3pt2b0pt8-CB2008']
+    (3, 'BooreAtkinson2008()') ['#6-SM2_a3b1-BA2008']
+    (3, 'CampbellBozorgnia2008()') ['#7-SM2_a3b1-CB2008']
     """
     def __init__(self, csm_info):
-        self.csm_info = csm_info
+        self.seed = csm_info.seed
+        self.num_samples = csm_info.num_samples
         self.rlzs_assoc = collections.defaultdict(list)
         self.gsim_by_trt = []  # rlz.ordinal -> {trt: gsim}
         self.rlzs_by_smodel = [[] for _ in range(len(csm_info.source_models))]
         self.gsims_by_trt_id = {}
-        self.col_ids_by_rlz = collections.defaultdict(set)
+        self.sm_ids = {}
+        self.samples = {}
+        for sm in csm_info.source_models:
+            for tm in sm.trt_models:
+                self.sm_ids[tm.id] = sm.ordinal
+                self.samples[tm.id] = sm.samples
 
-    @property
-    def num_samples(self):
+    def _init(self):
         """
-        Underlying number_of_logic_tree_samples
+        Finalize the initialization of the RlzsAssoc object by setting
+        the (reduced) weights of the realizations and the attribute
+        gsims_by_trt_id.
         """
-        return self.csm_info.source_model_lt.num_samples
+        if self.num_samples:
+            assert len(self.realizations) == self.num_samples
+            for rlz in self.realizations:
+                rlz.weight = 1. / self.num_samples
+        else:
+            tot_weight = sum(rlz.weight for rlz in self.realizations)
+            if tot_weight == 0:
+                raise ValueError('All realizations have zero weight??')
+            elif abs(tot_weight - 1) > 1E-12:  # allow for rounding errors
+                logging.warn('Some source models are not contributing, '
+                             'weights are being rescaled')
+            for rlz in self.realizations:
+                rlz.weight = rlz.weight / tot_weight
+
+        self.gsims_by_trt_id = groupby(
+            self.rlzs_assoc, operator.itemgetter(0),
+            lambda group: sorted(gsim for trt_id, gsim in group))
 
     @property
     def realizations(self):
         """Flat list with all the realizations"""
         return sum(self.rlzs_by_smodel, [])
 
-    def get_gsims_by_col(self):
-        """Return a list of lists of GSIMs of length num_collections"""
-        # TODO: add a special case for sampling?
-        return [self.gsims_by_trt_id.get(col['trt_id'], [])
-                for col in self.csm_info.cols]
-
-    # this useful to extract the ruptures affecting a given realization
-    def get_col_ids(self, rlz):
+    def get_rlzs_by_gsim(self, trt_id):
         """
-        :param rlz: a realization
-        :returns: a set of ses collection indices relevant for the realization
+        Returns a dictionary gsim -> rlzs
         """
-        # first consider the oversampling case, when the col_ids are known
-        col_ids = self.col_ids_by_rlz[rlz]
-        if col_ids:
-            return col_ids
-        # else consider the source model to which the realization belongs
-        # and extract the trt_model_ids, which are the same as the col_ids
-        return set(tm.id for sm in self.csm_info.source_models
-                   for tm in sm.trt_models if sm.path == rlz.sm_lt_path)
+        return {gsim: self[trt_id, str(gsim)]
+                for gsim in self.gsims_by_trt_id[trt_id]}
 
-    def _add_realizations(self, idx, lt_model, realizations, trts):
+    def get_rlzs_by_trt_id(self):
+        """
+        Returns a dictionary trt_id > [sorted rlzs]
+        """
+        rlzs_by_trt_id = collections.defaultdict(set)
+        for (trt_id, gsim), rlzs in self.rlzs_assoc.items():
+            rlzs_by_trt_id[trt_id].update(rlzs)
+        return {trt_id: sorted(rlzs)
+                for trt_id, rlzs in rlzs_by_trt_id.items()}
+
+    def _add_realizations(self, idx, lt_model, realizations):
         gsim_lt = lt_model.gsim_lt
+        trts = gsim_lt.tectonic_region_types
         rlzs = []
         for i, gsim_rlz in enumerate(realizations):
             weight = float(lt_model.weight) * float(gsim_rlz.weight)
-            rlz = LtRealization(idx, lt_model.path, gsim_rlz, weight)
-            self.gsim_by_trt.append(dict(
-                zip(gsim_lt.all_trts, gsim_rlz.value)))
+            rlz = LtRealization(idx[i], lt_model.path, gsim_rlz, weight, i)
+            self.gsim_by_trt.append(
+                dict(zip(gsim_lt.all_trts, gsim_rlz.value)))
             for trt_model in lt_model.trt_models:
                 if trt_model.trt in trts:
                     # ignore the associations to discarded TRTs
                     gs = gsim_lt.get_gsim_by_trt(gsim_rlz, trt_model.trt)
                     self.rlzs_assoc[trt_model.id, gs].append(rlz)
-                if lt_model.samples > 1:  # oversampling
-                    col_id = self.csm_info.col_ids_by_trt_id[trt_model.id][i]
-                    self.col_ids_by_rlz[rlz].add(col_id)
-            idx += 1
             rlzs.append(rlz)
         self.rlzs_by_smodel[lt_model.ordinal] = rlzs
-        return idx
 
-    def combine_curves(self, results, agg, acc):
+    def extract(self, rlz_indices, csm_info):
         """
-        :param results: dictionary (trt_model_id, gsim_name) -> curves
-        :param agg: aggregation function (composition of probabilities)
-        :returns: a dictionary rlz -> aggregated curves
+        Extract a RlzsAssoc instance containing only the given realizations.
+
+        :param rlz_indices: a list of realization indices from 0 to R - 1
         """
-        ad = AccumDict({rlz: acc for rlz in self.realizations})
-        for key, value in results.items():
+        assoc = self.__class__(csm_info)
+        if len(rlz_indices) == 1:
+            realizations = [self.realizations[rlz_indices[0]]]
+        else:
+            realizations = operator.itemgetter(*rlz_indices)(self.realizations)
+        rlzs_smpath = groupby(realizations, operator.attrgetter('sm_lt_path'))
+        smodel_from = {sm.path: sm for sm in csm_info.source_models}
+        for smpath, rlzs in rlzs_smpath.items():
+            assoc._add_realizations(
+                [r.ordinal for r in rlzs], smodel_from[smpath],
+                [rlz.gsim_rlz for rlz in rlzs])
+        assoc._init()
+        return assoc
+
+    # used in classical and event_based calculators
+    def combine_curves(self, results):
+        """
+        :param results: dictionary (trt_model_id, gsim) -> curves
+        :returns: a dictionary rlz -> aggregate curves
+        """
+        acc = {rlz: ProbabilityMap() for rlz in self.realizations}
+        for key in results:
             for rlz in self.rlzs_assoc[key]:
-                ad[rlz] = agg(ad[rlz], value)
-        return ad
+                acc[rlz] |= results[key]
+        return acc
 
-    def combine_gmfs(self, gmfs):
-        """
-        :param gmfs: datastore /gmfs object
-        :returns: a list of dictionaries rupid -> gmf array
-        """
-        gsims_by_col = self.get_gsims_by_col()
-        dicts = [{} for rlz in self.realizations]
-        for col_id, gsims in enumerate(gsims_by_col):
-            try:
-                dataset = gmfs['col%02d' % col_id]
-            except KeyError:  # empty dataset
-                continue
-            trt_id = self.csm_info.get_trt_id(col_id)
-            gmfs_by_rupid = groupby(
-                dataset.value, lambda row: row['idx'], list)
-            for gsim in gsims:
-                gs = str(gsim)
-                for rlz in self.rlzs_assoc[trt_id, gs]:
-                    col_ids = self.col_ids_by_rlz[rlz]
-                    if not col_ids or col_id in col_ids:
-                        for rupid, rows in gmfs_by_rupid.items():
-                            dicts[rlz.ordinal][rupid] = numpy.array(
-                                [r[gs] for r in rows], rows[0][gs].dtype)
-        return dicts
-
+    # used in riskinput
     def combine(self, results, agg=agg_prob):
         """
-        :param results: a dictionary (trt_model_id, gsim_name) -> floats
+        :param results: a dictionary (trt_model_id, gsim) -> floats
         :param agg: an aggregation function
         :returns: a dictionary rlz -> aggregated floats
 
         Example: a case with tectonic region type T1 with GSIMS A, B, C
         and tectonic region type T2 with GSIMS D, E.
 
-        >>> assoc = RlzsAssoc(CompositionInfo([], []))
-        >>> assoc.rlzs_assoc = {
+        >> assoc = RlzsAssoc(CompositionInfo([], []))
+        >> assoc.rlzs_assoc = {
         ... ('T1', 'A'): ['r0', 'r1'],
         ... ('T1', 'B'): ['r2', 'r3'],
         ... ('T1', 'C'): ['r4', 'r5'],
         ... ('T2', 'D'): ['r0', 'r2', 'r4'],
         ... ('T2', 'E'): ['r1', 'r3', 'r5']}
         ...
-        >>> results = {
+        >> results = {
         ... ('T1', 'A'): 0.01,
         ... ('T1', 'B'): 0.02,
         ... ('T1', 'C'): 0.03,
         ... ('T2', 'D'): 0.04,
         ... ('T2', 'E'): 0.05,}
         ...
-        >>> combinations = assoc.combine(results, operator.add)
-        >>> for key, value in sorted(combinations.items()): print key, value
+        >> combinations = assoc.combine(results, operator.add)
+        >> for key, value in sorted(combinations.items()): print key, value
         r0 0.05
         r1 0.06
         r2 0.06
@@ -419,10 +480,10 @@ class RlzsAssoc(collections.Mapping):
         the aggregation function is the `agg_curves` function, a composition of
         probability, which however is close to the sum for small probabilities.
         """
-        ad = AccumDict()
+        ad = {rlz: 0 for rlz in self.realizations}
         for key, value in results.items():
             for rlz in self.rlzs_assoc[key]:
-                ad[rlz] = agg(ad.get(rlz, 0), value)
+                ad[rlz] = agg(ad[rlz], value)
         return ad
 
     def __iter__(self):
@@ -441,11 +502,25 @@ class RlzsAssoc(collections.Mapping):
             if len(rlzs) > 10:  # short representation
                 rlzs = ['%d realizations' % len(rlzs)]
             pairs.append(('%s,%s' % key, rlzs))
-        return '<%s(%d)\n%s>' % (self.__class__.__name__, len(self),
-                                 '\n'.join('%s: %s' % pair for pair in pairs))
+        return '<%s(size=%d, rlzs=%d)\n%s>' % (
+            self.__class__.__name__, len(self), len(self.realizations),
+            '\n'.join('%s: %s' % pair for pair in pairs))
 
-# collection <-> trt model associations
-col_dt = numpy.dtype([('trt_id', numpy.uint32), ('sample', numpy.uint32)])
+LENGTH = 256
+
+source_model_dt = numpy.dtype([
+    ('name', (bytes, LENGTH)),
+    ('weight', F32),
+    ('path', (bytes, LENGTH)),
+    ('num_rlzs', U32),
+    ('samples', U32),
+])
+
+trt_model_dt = numpy.dtype(
+    [('trt_id', U32),
+     ('trti', U16),
+     ('effrup', I32),
+     ('sm_id', U32)])
 
 
 class CompositionInfo(object):
@@ -456,34 +531,69 @@ class CompositionInfo(object):
     :param source_model_lt: a SourceModelLogicTree object
     :param source_models: a list of SourceModel instances
     """
-    def __init__(self, source_model_lt, source_models):
-        self.source_model_lt = source_model_lt
+    @classmethod
+    def fake(cls, gsimlt=None):
+        """
+        :returns:
+            a fake `CompositionInfo` instance with the given gsim logic tree
+            object; if None, builds automatically a fake gsim logic tree
+        """
+        weight = 1
+        fakeSM = SourceModel(
+            'fake', weight,  'b1', [TrtModel('*', eff_ruptures=1)],
+            gsimlt or logictree.GsimLogicTree.from_('FromFile'),
+            ordinal=0, samples=1)
+        return cls(seed=0, num_samples=0, source_models=[fakeSM])
+
+    def __init__(self, seed, num_samples, source_models):
+        self.seed = seed
+        self.num_samples = num_samples
         self.source_models = source_models
-        cols = []
-        col_id = 0
-        self.col_ids_by_trt_id = collections.defaultdict(list)
-        self.tmdict = {}  # trt_id -> trt_model
-        for sm in self.source_models:
-            for trt_model in sm.trt_models:
-                trt_model.source_model = sm
-                trt_id = trt_model.id
-                self.tmdict[trt_id] = trt_model
-                for idx in range(sm.samples):
-                    cols.append((trt_id, idx))
-                    self.col_ids_by_trt_id[trt_id].append(col_id)
-                    col_id += 1
-        self.cols = numpy.array(cols, col_dt)
 
     def __getnewargs__(self):
         # with this CompositionInfo instances will be unpickled correctly
-        return self.source_model_lt, self.source_models
+        return self.seed, self.num_samples, self.source_models
 
-    @property
-    def num_collections(self):
-        """
-        Return the number of underlying collections
-        """
-        return len(self.cols)
+    def __toh5__(self):
+        trts = sorted(set(trt_model.trt for sm in self.source_models
+                          for trt_model in sm.trt_models))
+        trti = {trt: i for i, trt in enumerate(trts)}
+        data = []
+        for sm in self.source_models:
+            for trt_model in sm.trt_models:
+                # the number of effective realizations is set by get_rlzs_assoc
+                data.append((trt_model.id, trti[trt_model.trt],
+                             trt_model.eff_ruptures, sm.ordinal))
+        lst = [(sm.name, sm.weight, '_'.join(sm.path),
+                sm.gsim_lt.get_num_paths(), sm.samples)
+               for i, sm in enumerate(self.source_models)]
+        gsim_lt = self.source_models[0].gsim_lt
+        return (dict(
+            tm_data=numpy.array(data, trt_model_dt),
+            sm_data=numpy.array(lst, source_model_dt)),
+                dict(seed=self.seed, num_samples=self.num_samples,
+                     trts=trts, gsim_lt_xml=str(gsim_lt),
+                     gsim_fname=gsim_lt.fname))
+
+    def __fromh5__(self, dic, attrs):
+        tm_data = group_array(dic['tm_data'], 'sm_id')
+        sm_data = dic['sm_data']
+        vars(self).update(attrs)
+        self.source_models = []
+        for sm_id, rec in enumerate(sm_data):
+            tdata = tm_data[sm_id]
+            trtmodels = [
+                TrtModel(self.trts[trti], id=trt_id, eff_ruptures=effrup)
+                for trt_id, trti, effrup, sm_id in tdata if effrup > 0]
+            path = tuple(rec['path'].split('_'))
+            trts = set(tm.trt for tm in trtmodels)
+            if self.gsim_fname.endswith('.xml'):
+                gsim_lt = logictree.GsimLogicTree(self.gsim_fname, trts)
+            else:  # fake file with the name of the GSIM
+                gsim_lt = logictree.GsimLogicTree.from_(self.gsim_fname)
+            sm = SourceModel(rec['name'], rec['weight'], path, trtmodels,
+                             gsim_lt, sm_id, rec['samples'])
+            self.source_models.append(sm)
 
     def get_num_rlzs(self, source_model=None):
         """
@@ -492,40 +602,69 @@ class CompositionInfo(object):
         """
         if source_model is None:
             return sum(self.get_num_rlzs(sm) for sm in self.source_models)
-        if self.source_model_lt.num_samples:
+        if self.num_samples:
             return source_model.samples
         return source_model.gsim_lt.get_num_paths()
 
-    def get_max_samples(self):
+    def get_rlzs_assoc(self, count_ruptures=None):
         """
-        Return the maximum number of samples of the source model
-        """
-        return max(len(col_ids) for col_ids in self.col_ids_by_trt_id.values())
+        Return a RlzsAssoc with fields realizations, gsim_by_trt,
+        rlz_idx and trt_gsims.
 
-    def get_num_samples(self, trt_id):
+        :param count_ruptures: a function trt_model -> num_ruptures
         """
-        :param trt_id: tectonic region type object ID
-        :returns: how many times the sources of that TRT are to be sampled
-        """
-        return len(self.col_ids_by_trt_id[trt_id])
+        assoc = RlzsAssoc(self)
+        random_seed = self.seed
+        idx = 0
+        for i, smodel in enumerate(self.source_models):
+            # collect the effective tectonic region types and ruptures
+            trts = set()
+            for tm in smodel.trt_models:
+                if count_ruptures:
+                    tm.eff_ruptures = count_ruptures(tm)
+                if tm.eff_ruptures:
+                    trts.add(tm.trt)
+            # recompute the GSIM logic tree if needed
+            if trts != set(smodel.gsim_lt.tectonic_region_types):
+                before = smodel.gsim_lt.get_num_paths()
+                smodel.gsim_lt.reduce(trts)
+                after = smodel.gsim_lt.get_num_paths()
+                logging.warn('Reducing the logic tree of %s from %d to %d '
+                             'realizations', smodel.name, before, after)
+            if self.num_samples:  # sampling
+                rnd = random.Random(random_seed + idx)
+                rlzs = logictree.sample(smodel.gsim_lt, smodel.samples, rnd)
+            else:  # full enumeration
+                rlzs = logictree.get_effective_rlzs(smodel.gsim_lt)
+            if rlzs:
+                indices = numpy.arange(idx, idx + len(rlzs))
+                idx += len(indices)
+                assoc._add_realizations(indices, smodel, rlzs)
+            elif trts:
+                logging.warn('No realizations for %s, %s',
+                             '_'.join(smodel.path), smodel.name)
+        # NB: realizations could be filtered away by logic tree reduction
+        if assoc.realizations:
+            assoc._init()
+        return assoc
 
-    def get_trt_id(self, col_id):
+    def get_source_model(self, trt_model_id):
         """
-        :param col_id: the ordinal of a SESCollection
-        :returns: the ID of the associated TrtModel
+        Return the source model for the given trt_model_id
         """
-        for cid, col in enumerate(self.cols):
-            if cid == col_id:
-                return col['trt_id']
-        raise KeyError('There is no TrtModel associated to the collection %d!'
-                       % col_id)
+        for smodel in self.source_models:
+            for trt_model in smodel.trt_models:
+                if trt_model.id == trt_model_id:
+                    return smodel
 
-    def get_triples(self):
+    def get_trt(self, trt_model_id):
         """
-        Yield triples (trt_id, idx, col_id) in order
+        Return the TRT string for the given trt_model_id
         """
-        for col_id, col in enumerate(self.cols):
-            yield col['trt_id'], col['sample'], col_id
+        for smodel in self.source_models:
+            for trt_model in smodel.trt_models:
+                if trt_model.id == trt_model_id:
+                    return trt_model.trt
 
     def __repr__(self):
         info_by_model = collections.OrderedDict(
@@ -546,10 +685,18 @@ class CompositeSourceModel(collections.Sequence):
     :param source_models:
         a list of :class:`openquake.commonlib.source.SourceModel` tuples
     """
-    def __init__(self, source_model_lt, source_models):
+    def __init__(self, source_model_lt, source_models, set_weight=True):
         self.source_model_lt = source_model_lt
         self.source_models = source_models
         self.source_info = ()  # set by the SourceFilterSplitter
+        self.split_map = {}
+        if set_weight:
+            self.set_weights()
+        # must go after set_weights to have the correct .num_ruptures
+        self.info = CompositionInfo(
+            self.source_model_lt.seed,
+            self.source_model_lt.num_samples,
+            [sm.get_skeleton() for sm in self.source_models])
 
     @property
     def trt_models(self):
@@ -560,99 +707,45 @@ class CompositeSourceModel(collections.Sequence):
             for trt_model in sm.trt_models:
                 yield trt_model
 
-    def get_sources(self):
+    def get_sources(self, kind='all'):
         """
-        Extract the sources contained in the internal source models.
+        Extract the sources contained in the source models by optionally
+        filtering and splitting them, depending on the passed parameters.
         """
         sources = []
-        ordinal = 0
+        maxweight = self.maxweight
         for trt_model in self.trt_models:
             for src in trt_model:
-                if hasattr(src, 'trt_model_id'):
-                    # .trt_model_id is missing for source nodes
-                    src.trt_model_id = trt_model.id
-                    src.id = ordinal
-                    ordinal += 1
-                sources.append(src)
+                if kind == 'all':
+                    sources.append(src)
+                elif kind == 'light' and src.weight <= maxweight:
+                    sources.append(src)
+                elif kind == 'heavy' and src.weight > maxweight:
+                    sources.append(src)
         return sources
 
     def get_num_sources(self):
         """
         :returns: the total number of sources in the model
         """
-        return len(self.get_sources())
+        return sum(len(trt_model) for trt_model in self.trt_models)
 
-    def count_ruptures(self, really=False):
+    def set_weights(self):
         """
-        Update the attribute .num_ruptures in each TRT model.
-        This method is lazy, i.e. the number is not updated if it is already
-        set and nonzero, unless `really` is True.
+        Update the attributes .weight and src.num_ruptures for each TRT model
+        .weight of the CompositeSourceModel.
         """
+        self.weight = self.filtered_weight = 0
         for trt_model in self.trt_models:
-            if trt_model.num_ruptures == 0 or really:
-                trt_model.num_ruptures = sum(
-                    src.count_ruptures() for src in trt_model)
-
-    def get_info(self):
-        """
-        Return a CompositionInfo instance for the current composite model
-        """
-        return CompositionInfo(
-            self.source_model_lt, list(map(get_skeleton, self.source_models)))
-
-    def get_rlzs_assoc(self, get_weight=lambda tm: tm.num_ruptures):
-        """
-        Return a RlzsAssoc with fields realizations, gsim_by_trt,
-        rlz_idx and trt_gsims.
-
-        :param get_weight: a function trt_model -> positive number
-        """
-        assoc = RlzsAssoc(self.get_info())
-        random_seed = self.source_model_lt.seed
-        num_samples = self.source_model_lt.num_samples
-        idx = 0
-        for smodel in self.source_models:
-            # collect the effective tectonic region types
-            trts = set(tm.trt for tm in smodel.trt_models if get_weight(tm))
-            # recompute the GSIM logic tree if needed
-            if trts != set(smodel.gsim_lt.tectonic_region_types):
-                before = smodel.gsim_lt.get_num_paths()
-                smodel.gsim_lt.reduce(trts)
-                after = smodel.gsim_lt.get_num_paths()
-                logging.warn('Reducing the logic tree of %s from %d to %d '
-                             'realizations', smodel.name, before, after)
-            if num_samples:  # sampling
-                rnd = random.Random(random_seed + idx)
-                rlzs = logictree.sample(smodel.gsim_lt, smodel.samples, rnd)
-            else:  # full enumeration
-                rlzs = logictree.get_effective_rlzs(smodel.gsim_lt)
-            if rlzs:
-                idx = assoc._add_realizations(idx, smodel, rlzs, trts)
-                for trt_model in smodel.trt_models:
-                    trt_model.gsims = smodel.gsim_lt.values[trt_model.trt]
-            else:
-                logging.warn('No realizations for %s, %s',
-                             '_'.join(smodel.path), smodel.name)
-        if assoc.realizations:
-            if num_samples:
-                assert len(assoc.realizations) == num_samples
-                for rlz in assoc.realizations:
-                    rlz.weight = 1. / num_samples
-            else:
-                tot_weight = sum(rlz.weight for rlz in assoc.realizations)
-                if tot_weight == 0:
-                    raise ValueError('All realizations have zero weight??')
-                elif abs(tot_weight - 1) > 1E-12:  # allow for rounding errors
-                    logging.warn('Some source models are not contributing, '
-                                 'weights are being rescaled')
-                for rlz in assoc.realizations:
-                    rlz.weight = rlz.weight / tot_weight
-
-        assoc.gsims_by_trt_id = groupby(
-            assoc.rlzs_assoc, operator.itemgetter(0),
-            lambda group: sorted(valid.gsim(gsim) for trt_id, gsim in group))
-
-        return assoc
+            weight = 0
+            num_ruptures = 0
+            for src in trt_model:
+                weight += src.weight
+                num_ruptures += src.num_ruptures
+            trt_model.weight = weight
+            trt_model.sources = sorted(
+                trt_model, key=operator.attrgetter('source_id'))
+            self.weight += weight
 
     def __repr__(self):
         """
@@ -700,220 +793,200 @@ def collect_source_model_paths(smlt):
     return sorted(set(src_paths))
 
 
-# ########################## SourceFilterSplitter ########################### #
+# ########################## SourceManager ########################### #
 
-def filter_and_split(src, sourceprocessor):
-    """
-    Filter and split the source by using the source processor.
-    Also, sets the sub sources `.weight` attribute.
-
-    :param src: a hazardlib source object
-    :param sourceprocessor: a SourceFilterSplitter object
-    :returns: a named tuple of type SourceInfo
-    """
-    if sourceprocessor.sitecol:  # filter
-        info = sourceprocessor.filter(src)
-        if not info.sources:
-            return info  # filtered away
-        filter_time = info.filter_time
-    else:  # only split
-        filter_time = 0
-    t1 = time.time()
-    out = []
-    weight_time = 0
-    weight = 0
-    for ss in sourceconverter.split_source(src):
-        if sourceprocessor.weight:
-            t = time.time()
-            ss.weight = get_weight(ss)
-            weight_time += time.time() - t
-            weight += ss.weight
-        out.append(ss)
-    src.weight = weight
-    split_time = time.time() - t1 - weight_time
-    return SourceInfo(src.trt_model_id, src.source_id, src.__class__.__name__,
-                      weight, out, filter_time, weight_time, split_time)
-
+def source_info_iadd(self, other):
+    assert self.trt_model_id == other.trt_model_id
+    assert self.source_id == other.source_id
+    return self.__class__(
+        self.trt_model_id, self.source_id, self.source_class, self.weight,
+        self.sources, self.filter_time + other.filter_time,
+        self.split_time + other.split_time, self.calc_time + other.calc_time)
 
 SourceInfo = collections.namedtuple(
     'SourceInfo', 'trt_model_id source_id source_class weight sources '
-    'filter_time weight_time split_time')
+    'filter_time split_time calc_time')
+SourceInfo.__iadd__ = source_info_iadd
 
-source_info_dt = numpy.dtype(
-    [('trt_model_id', numpy.uint32),
-     ('source_id', (bytes, 20)),
-     ('source_class', (bytes, 20)),
-     ('weight', numpy.float32),
-     ('split_num', numpy.uint32),
-     ('filter_time', numpy.float32),
-     ('weight_time', numpy.float32),
-     ('split_time', numpy.float32)])
+source_info_dt = numpy.dtype([
+    ('trt_model_id', numpy.uint32),  # 0
+    ('source_id', (bytes, valid.MAX_ID_LENGTH)),  # 1
+    ('source_class', (bytes, 30)),   # 2
+    ('weight', numpy.float32),       # 3
+    ('split_num', numpy.uint32),     # 4
+    ('filter_time', numpy.float32),  # 5
+    ('split_time', numpy.float32),   # 6
+    ('calc_time', numpy.float32),    # 7
+])
 
 
-class BaseSourceProcessor(object):
+source_chunk_dt = numpy.dtype([
+    ('num_sources', numpy.uint32),
+    ('weight', numpy.float32),
+    ('sent', numpy.int32)])
+
+
+class SourceManager(object):
     """
-    Do nothing source processor.
-
-    :param sitecol:
-        a :class:`openquake.hazardlib.site.SiteCollection` instance
-    :param maxdist:
-        maximum distance for the filtering
-    :param monitor:
-        a PerformanceMonitor instance
+    Manager associated to a CompositeSourceModel instance.
+    Filter and split sources and send them to the worker tasks.
     """
-    weight = False  # when True, set the weight on each source
-
-    def __init__(self, sitecol, maxdist, monitor):
-        self.sitecol = sitecol
-        self.maxdist = maxdist
+    def __init__(self, csm, taskfunc, maximum_distance,
+                 dstore, monitor, random_seed=None,
+                 filter_sources=True, num_tiles=1):
+        self.tm = parallel.TaskManager(taskfunc)
+        self.csm = csm
+        self.maximum_distance = maximum_distance
+        self.random_seed = random_seed
+        self.dstore = dstore
         self.monitor = monitor
+        self.filter_sources = filter_sources
+        self.num_tiles = num_tiles
+        self.rlzs_assoc = csm.info.get_rlzs_assoc()
+        self.split_map = {}  # trt_model_id, source_id -> split sources
+        self.source_chunks = []
+        self.infos = {}  # trt_model_id, source_id -> SourceInfo tuple
+        if random_seed is not None:
+            # generate unique seeds for each rupture with numpy.arange
+            self.src_serial = {}
+            n = sum(trtmod.tot_ruptures() for trtmod in self.csm.trt_models)
+            rup_serial = numpy.arange(n, dtype=numpy.uint32)
+            start = 0
+            for src in self.csm.get_sources('all'):
+                nr = src.num_ruptures
+                self.src_serial[src.id] = rup_serial[start:start + nr]
+                start += nr
+        # decrease the weight with the number of tiles, to increase
+        # the number of generated tasks; this is an heuristic trick
+        self.maxweight = self.csm.maxweight * math.sqrt(num_tiles) / 2.
+        logging.info('Instantiated SourceManager with maxweight=%.1f',
+                     self.maxweight)
+
+    def get_sources(self, kind, tile):
+        """
+        :param kind: a string 'light', 'heavy' or 'all'
+        :param tile: a :class:`openquake.hazardlib.site.Tile` instance
+        :returns: the sources of the given kind affecting the given tile
+        """
+        filter_mon = self.monitor('filtering sources')
+        split_mon = self.monitor('splitting sources')
+        for src in self.csm.get_sources(kind):
+            filter_time = split_time = 0
+            if self.filter_sources:
+                with filter_mon:
+                    try:
+                        if src not in tile:
+                            continue
+                    except:
+                        etype, err, tb = sys.exc_info()
+                        msg = 'An error occurred with source id=%s: %s'
+                        msg %= (src.source_id, err)
+                        raise_(etype, msg, tb)
+                filter_time = filter_mon.dt
+            if kind == 'heavy':
+                if (src.trt_model_id, src.id) not in self.split_map:
+                    logging.info('splitting %s of weight %s',
+                                 src, src.weight)
+                    with split_mon:
+                        sources = list(sourceconverter.split_source(src))
+                        self.split_map[src.trt_model_id, src.id] = sources
+                    split_time = split_mon.dt
+                    self.set_serial(src, sources)
+                for ss in self.split_map[src.trt_model_id, src.id]:
+                    ss.id = src.id
+                    yield ss
+            else:
+                self.set_serial(src)
+                yield src
+            split_sources = self.split_map.get(
+                (src.trt_model_id, src.id), [src])
+            info = SourceInfo(src.trt_model_id, src.source_id,
+                              src.__class__.__name__,
+                              src.weight, len(split_sources),
+                              filter_time, split_time, 0)
+            key = (src.trt_model_id, src.source_id)
+            if key in self.infos:
+                self.infos[key] += info
+            else:
+                self.infos[key] = info
+
+        filter_mon.flush()
+        split_mon.flush()
+
+    def set_serial(self, src, split_sources=()):
+        """
+        Set a serial number per each rupture in a source, managing also the
+        case of split sources, if any.
+        """
+        if self.random_seed is not None:
+            src.serial = self.src_serial[src.id]
+            if split_sources:
+                start = 0
+                for ss in split_sources:
+                    nr = ss.num_ruptures
+                    ss.serial = src.serial[start:start + nr]
+                    start += nr
+
+    def submit_sources(self, sitecol, siteidx=0):
+        """
+        Submit the light sources and then the (split) heavy sources.
+        Only the sources affecting the sitecol as considered.
+        """
+        tile = Tile(sitecol, self.maximum_distance)
+        for kind in ('light', 'heavy'):
+            if self.filter_sources:
+                logging.info('Filtering %s sources', kind)
+            sources = list(self.get_sources(kind, tile))
+            if not sources:
+                continue
+            for src in sources:
+                self.csm.filtered_weight += src.weight
+            nblocks = 0
+            for block in block_splitter(
+                    sources, self.maxweight,
+                    operator.attrgetter('weight'),
+                    operator.attrgetter('trt_model_id')):
+                sent = self.tm.submit(block, sitecol, siteidx,
+                                      self.rlzs_assoc, self.monitor.new())
+                self.source_chunks.append(
+                    (len(block), block.weight, sum(sent.values())))
+                nblocks += 1
+            logging.info('Sent %d sources in %d block(s)',
+                         len(sources), nblocks)
+
+    def store_source_info(self, dstore):
+        """
+        Save the `source_info` array and its attributes in the datastore.
+
+        :param dstore: the datastore
+        """
+        if self.infos:
+            values = self.infos.values()
+            values.sort(
+                key=lambda info: info.filter_time + info.split_time,
+                reverse=True)
+            dstore['source_info'] = numpy.array(values, source_info_dt)
+            attrs = dstore['source_info'].attrs
+            attrs['maxweight'] = self.csm.maxweight
+            self.infos.clear()
+        if self.source_chunks:
+            dstore['source_chunks'] = sc = numpy.array(
+                self.source_chunks, source_chunk_dt)
+            attrs = dstore['source_chunks'].attrs
+            attrs['nbytes'] = sc.nbytes
+            attrs['sent'] = sc['sent'].sum()
+            attrs['task_name'] = self.tm.name
+            del self.source_chunks
 
 
-class SourceFilter(BaseSourceProcessor):
+@parallel.litetask
+def count_eff_ruptures(sources, sitecol, siteidx, rlzs_assoc, monitor):
     """
-    Filter sequentially the sources of the given CompositeSourceModel
-    instance. An array `.source_info` is added to the instance, containing
-    information about the processing times.
+    Count the number of ruptures contained in the given sources and return
+    a dictionary trt_model_id -> num_ruptures. All sources belong to the
+    same tectonic region type.
     """
-    def filter(self, src):
-        t0 = time.time()
-        sites = src.filter_sites_by_distance_to_source(
-            self.maxdist, self.sitecol)
-        t1 = time.time()
-        filter_time = t1 - t0
-        if sites is not None and self.weight:
-            t2 = time.time()
-            weight = get_weight(src)
-            src.weight = weight
-            weight_time = time.time() - t2
-        else:
-            weight = numpy.nan
-            weight_time = 0
-        sources = [] if sites is None else [src]
-        return SourceInfo(
-            src.trt_model_id, src.source_id, src.__class__.__name__,
-            weight, sources, filter_time, weight_time, 0)
-
-    def agg_source_info(self, acc, info):
-        """
-        :param acc: a dictionary {trt_model_id: sources}
-        :param info: a SourceInfo instance
-        """
-        self.infos.append(
-            SourceInfo(info.trt_model_id, info.source_id, info.source_class,
-                       info.weight, len(info.sources), info.filter_time,
-                       info.weight_time, info.split_time))
-        return acc + {info.trt_model_id: info.sources}
-
-    def process(self, csm, dstore, dummy=None):
-        """
-        :param csm: a CompositeSourceModel instance
-        :param dstore: a DataStore instance
-        :returns: the times spent in sequential and parallel processing
-        """
-        sources = csm.get_sources()
-        self.infos = []
-        seqtime, partime = 0, 0
-        sources_by_trt = AccumDict()
-
-        logging.info('Sequential processing of %d sources...', len(sources))
-        t1 = time.time()
-        for src in sources:
-            sources_by_trt = self.agg_source_info(
-                sources_by_trt, self.filter(src))
-        seqtime = time.time() - t1
-        self.update(csm, dstore, sources_by_trt)
-        logging.info('fast sources filtering/splitting: %s', seqtime)
-        logging.info('slow sources filtering/splitting: %s', partime)
-
-    def update(self, csm, dstore, sources_by_trt):
-        """
-        Store the `source_info` array in the composite source model.
-
-        :param csm: a CompositeSourceModel instance
-        :param dstore: a DataStore instance
-        :param sources_by_trt: a dictionary trt_model_id -> sources
-        """
-        self.infos.sort(
-            key=lambda info: info.filter_time + info.weight_time +
-            info.split_time, reverse=True)
-        dstore['pre_source_info'] = numpy.array(self.infos, source_info_dt)
-        del self.infos[:]
-
-        # update trt_model.sources
-        for source_model in csm:
-            for trt_model in source_model.trt_models:
-                trt_model.sources = sorted(
-                    sources_by_trt.get(trt_model.id, []),
-                    key=operator.attrgetter('source_id'))
-                if not trt_model.sources:
-                    logging.warn(
-                        'Could not find sources close to the sites in %s '
-                        'sm_lt_path=%s, maximum_distance=%s km, TRT=%s',
-                        source_model.name, source_model.path,
-                        self.maxdist, trt_model.trt)
-
-
-class SourceFilterWeighter(SourceFilter):
-    """
-    Filter sequentially the sources of the given CompositeSourceModel
-    instance and compute their weights. An array `.source_info` is added
-    to the instance, containing information about the processing times.
-    """
-    weight = True
-
-
-class SourceFilterSplitter(SourceFilterWeighter):
-    """
-    Filter and split in parallel the sources of the given CompositeSourceModel
-    instance. An array `.source_info` is added to the instance, containing
-    information about the processing times and the splitting process.
-
-    :param sitecol: a SiteCollection instance
-    :param maxdist: maximum distance for the filtering
-    """
-    def process(self, csm, dstore, no_distribute=False):
-        """
-        :param csm: a CompositeSourceModel instance
-        :param dstore: a DataStore instance
-        :param no_distribute: flag to disable parallel processing
-        :returns: the times spent in sequential and parallel processing
-        """
-        sources = csm.get_sources()
-        fast_sources = [(src, self) for src in sources
-                        if src.__class__.__name__ in
-                        ('PointSource', 'AreaSource')]
-        slow_sources = [(src, self) for src in sources
-                        if src.__class__.__name__ not in
-                        ('PointSource', 'AreaSource')]
-        self.infos = []
-        seqtime, partime = 0, 0
-        sources_by_trt = AccumDict()
-
-        # start multicore processing
-        if slow_sources:
-            t0 = time.time()
-            logging.warn('Processing %d slow sources...', len(slow_sources))
-            with mock.patch.object(
-                    parallel, 'no_distribute', lambda: no_distribute):
-                ss = parallel.TaskManager.starmap(
-                    filter_and_split, slow_sources)
-
-        # single core processing
-        if fast_sources:
-            logging.info('Processing %d fast sources...', len(fast_sources))
-            t1 = time.time()
-            sources_by_trt += reduce(
-                self.agg_source_info,
-                itertools.starmap(filter_and_split, fast_sources), AccumDict())
-            seqtime = time.time() - t1
-
-        # finish multicore processing
-        sources_by_trt += (ss.reduce(self.agg_source_info)
-                           if slow_sources else {})
-        if slow_sources:
-            partime = time.time() - t0
-
-        self.update(csm, dstore, sources_by_trt)
-
-        return seqtime, partime
+    acc = AccumDict()
+    acc.eff_ruptures = {sources[0].trt_model_id:
+                        sum(src.num_ruptures for src in sources)}
+    return acc

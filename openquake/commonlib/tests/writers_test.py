@@ -1,7 +1,26 @@
+# -*- coding: utf-8 -*-
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+#
+# Copyright (C) 2014-2016 GEM Foundation
+#
+# OpenQuake is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# OpenQuake is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with OpenQuake. If not, see <http://www.gnu.org/licenses/>.
+
 import os
 import unittest
 import tempfile
 from io import BytesIO
+from openquake.baselib.performance import memory_info
 from openquake.commonlib.writers import tostring, StreamingXMLWriter, write_csv
 from openquake.commonlib.node import LiteralNode
 from xml.etree import ElementTree as etree
@@ -58,14 +77,14 @@ xmlns="http://openquake.org/xmlns/nrml/0.4"
             raise unittest.SkipTest('psutil not installed')
         proc = psutil.Process(os.getpid())
         try:
-            rss = proc.get_memory_info().rss
+            rss = memory_info(proc).rss
         except psutil.AccessDenied:
             raise unittest.SkipTest('Memory info not accessible')
         devnull = open(os.devnull, 'w')
         with StreamingXMLWriter(devnull) as writer:
             for asset in assetgen(1000):
                 writer.serialize(asset)
-        allocated = proc.get_memory_info().rss - rss
+        allocated = memory_info(proc).rss - rss
         self.assertLess(allocated, 204800)  # < 200 KB
 
     def test_zero_node(self):
@@ -112,4 +131,4 @@ class WriteCsvTestCase(unittest.TestCase):
                           ([1, 2, 4], [3, 5, 6, 7]), 8)], gmf_dt)
         self.assert_export(
             a, 'A-PGA:int32:3,A-PGV:int32:4,B-PGA:int32:3,B-PGV:int32:4,'
-            'idx:int32:\n1 2 3,4 5 6 7,1 2 4,3 5 6 7,8\n')
+            'idx:int32\n1 2 3,4 5 6 7,1 2 4,3 5 6 7,8\n')
